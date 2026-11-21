@@ -44,15 +44,117 @@ class ProviderAmbiguityTests(unittest.TestCase):
         obj_path.parent.mkdir(parents=True, exist_ok=True)
         obj_path.write_bytes(b"not parsed by choose_provider")
         obj = provider("app", obj_path, source="target")
-        with self.assertRaisesRegex(abi.AuditError, "ambiguous default-path providers"):
-            abi.choose_provider(
-                "libsample.so", obj, {}, [], index, root, [], False
-            )
+        with mock.patch.object(abi, "elf_soname", return_value="libsample.so"):
+            with self.assertRaisesRegex(abi.AuditError, "ambiguous default-path providers"):
+                abi.choose_provider(
+                    "libsample.so", obj, {}, [], index, root, [], False
+                )
 
-    def test_identical_bytes_at_different_paths_are_ambiguous(self):
+    def test_same_sha_different_inodes_without_path_sensitive_records_are_equivalent(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            self.assert_ambiguous(root, self.make_index(root, b"same", b"same"))
+            candidates = self.make_index(root, b"same", b"same")["libsample.so"]
+            with mock.patch.object(abi, "elf_soname", return_value="libsample.so"), mock.patch.object(
+                abi, "elf_dynamic", return_value=(["libc.so.6"], [])
+            ):
+                collapsed, reason = abi.collapse_provider_candidates(candidates)
+            self.assertEqual(len(collapsed), 1)
+            self.assertIn("ABI-equivalent copies", reason)
+
+    @unittest.skipUnless(os.name == "posix", "hardlink inode behavior is exercised on Linux runner")
+    def test_same_sha_and_inode_are_one_physical_provider(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "lib" / "libsample.so"
+            second = root / "usr/lib/libsample.so"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"same inode")
+            os.link(first, second)
+            candidates = [
+                provider("libsample.so", first, sha256=abi.digest(first)),
+                provider("libsample.so", second, sha256=abi.digest(second)),
+            ]
+            with mock.patch.object(abi, "elf_dynamic", return_value=(["libc.so.6"], [])):
+                collapsed, reason = abi.collapse_provider_candidates(candidates)
+            self.assertEqual(len(collapsed), 1)
+            self.assertIn("device/inode identity", reason)
+
+    @unittest.skipUnless(os.name == "posix", "hardlink path behavior is exercised on Linux runner")
+    def test_same_inode_hardlinks_with_origin_keep_distinct_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "lib" / "libsample.so"
+            second = root / "usr/lib/libsample.so"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"same inode with origin")
+            os.link(first, second)
+            candidates = [provider("libsample.so", p) for p in (first, second)]
+            with mock.patch.object(
+                abi, "elf_dynamic", return_value=([], [("RUNPATH", "$ORIGIN/../lib")])
+            ), mock.patch.object(abi, "elf_soname", return_value="libsample.so"):
+                collapsed, reason = abi.collapse_provider_candidates(candidates)
+            self.assertEqual(len(collapsed), 2)
+            self.assertIn("dynamic path token", reason)
+            app = root / "bin/app"
+            app.parent.mkdir(parents=True)
+            app.write_bytes(b"app")
+            with mock.patch.object(
+                abi, "elf_dynamic", return_value=([], [("RUNPATH", "$ORIGIN/../lib")])
+            ), mock.patch.object(abi, "elf_soname", return_value="libsample.so"):
+                with self.assertRaisesRegex(abi.AuditError, "ambiguous default-path providers"):
+                    abi.choose_provider(
+                        "libsample.so", provider("app", app), {}, [],
+                        {"libsample.so": candidates}, root, set(), False
+                    )
+
+    @unittest.skipUnless(os.name == "posix", "hardlink path behavior is exercised on Linux runner")
+    def test_same_inode_hardlinks_with_slash_dt_needed_keep_distinct_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "lib" / "libsample.so"
+            second = root / "usr/lib/libsample.so"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"same inode with slash dependency")
+            os.link(first, second)
+            candidates = [provider("libsample.so", p) for p in (first, second)]
+            with mock.patch.object(
+                abi, "elf_dynamic", return_value=(["private/libdep.so"], [])
+            ):
+                collapsed, reason = abi.collapse_provider_candidates(candidates)
+            self.assertEqual(len(collapsed), 2)
+            self.assertIn("DT_NEEDED contains a path", reason)
+
+    def test_same_sha_different_inodes_with_origin_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidates = self.make_index(root, b"same", b"same")["libsample.so"]
+            with mock.patch.object(abi, "elf_soname", return_value="libsample.so"), mock.patch.object(
+                abi, "elf_dynamic", return_value=(["libc.so.6"], [("RUNPATH", "$ORIGIN/../lib")])
+            ):
+                collapsed, reason = abi.collapse_provider_candidates(candidates)
+            self.assertEqual(len(collapsed), 2)
+            self.assertIn("dynamic path token", reason)
+
+    def test_same_sha_different_architectures_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidates = self.make_index(root, b"same", b"same")["libsample.so"]
+            candidates[1] = abi.Provider(**{**candidates[1].__dict__, "machine": "Advanced Micro Devices X86-64"})
+            collapsed, reason = abi.collapse_provider_candidates(candidates)
+            self.assertEqual(len(collapsed), 2)
+            self.assertIn("ELF class or machine", reason)
+
+    def test_same_sha_different_sonames_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidates = self.make_index(root, b"same", b"same")["libsample.so"]
+            with mock.patch.object(abi, "elf_soname", side_effect=["libsample.so", "other.so"]):
+                collapsed, reason = abi.explain_provider_equivalence(candidates)
+            self.assertFalse(collapsed)
+            self.assertIn("different ELF SONAME", reason)
 
     def test_different_hashes_at_different_paths_are_ambiguous(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -76,8 +178,12 @@ class ProviderAmbiguityTests(unittest.TestCase):
             with mock.patch.object(abi, "make_provider", side_effect=fake_make_provider):
                 index = abi.index_rootfs(root)
 
-            self.assertEqual(len(index["libsample.so"]), 1)
-            self.assertEqual(index["libsample.so"][0].physical_path, actual)
+            self.assertEqual(len(index["libsample.so"]), 2)
+            self.assertTrue(all(item.physical_path == actual for item in index["libsample.so"]))
+            with mock.patch.object(abi, "elf_dynamic", return_value=([], [])):
+                collapsed, reason = abi.collapse_provider_candidates(index["libsample.so"])
+            self.assertEqual(len(collapsed), 1)
+            self.assertIn("device/inode identity", reason)
 
 
 class LoaderPathTests(unittest.TestCase):
@@ -113,6 +219,24 @@ class LoaderPathTests(unittest.TestCase):
                 [Path(os.path.abspath(actual.parent / "../lib"))],
             )
 
+    def test_origin_uses_lookup_path_for_hardlink_alias(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "capsule-root"
+            root.mkdir()
+            physical = base / "storage/libsample.so"
+            logical = base / "lookup/libsample.so"
+            physical.parent.mkdir()
+            logical.parent.mkdir()
+            physical.write_bytes(b"same inode")
+            os.link(physical, logical)
+            obj = provider("libsample.so", physical, logical_path=logical)
+
+            self.assertEqual(
+                abi.mapped_rpath_entries(obj, "$ORIGIN", root),
+                [logical.parent],
+            )
+
     def test_only_exact_approved_artifact_is_external_provider(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
@@ -126,14 +250,120 @@ class LoaderPathTests(unittest.TestCase):
             obj_path.write_bytes(b"not parsed by choose_provider")
             obj = provider("app", obj_path, source="target")
 
-            with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")):
+            with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")), mock.patch.object(
+                abi, "elf_soname", return_value="libsample.so"
+            ):
                 selected, _ = abi.choose_provider(
-                    "libsample.so", obj, {"RUNPATH": "$ORIGIN/artifacts"}, [], {},
-                    root, {library.resolve()}, False
+                    "libsample.so", obj, {}, [], {}, root, {library.resolve()}, False
                 )
 
             self.assertEqual(selected.physical_path, library.resolve())
-            self.assertEqual(selected.source, "explicit-library")
+            self.assertEqual(selected.source, "LD_LIBRARY_PATH[explicit-file]")
+
+    def test_explicit_library_matches_ld_library_path_order_before_runpath(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "rootfs"
+            root.mkdir()
+            artifacts = base / "artifacts"
+            artifacts.mkdir()
+            approved = artifacts / "libsample.so"
+            approved.write_bytes(b"approved LD_LIBRARY_PATH library")
+            runpath_dir = base / "runpath"
+            runpath_dir.mkdir()
+            (runpath_dir / "libsample.so").write_bytes(b"RUNPATH must not win")
+            obj_path = base / "app"
+            obj_path.write_bytes(b"target")
+            obj = provider("app", obj_path, source="target")
+
+            with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")), mock.patch.object(
+                abi, "elf_soname", return_value="libsample.so"
+            ):
+                inherited = [root / "previous/rpath"]
+                selected, inherited_result = abi.choose_provider(
+                    "libsample.so", obj, {"RUNPATH": "$ORIGIN/runpath"}, inherited, {},
+                    root, {approved.resolve()}, False
+                )
+
+            self.assertEqual(selected.physical_path, approved.resolve())
+            self.assertEqual(selected.source, "LD_LIBRARY_PATH[explicit-file]")
+            self.assertEqual(inherited_result, inherited)
+
+    def test_explicit_library_preserves_rpath_for_transitive_dependency(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "rootfs"
+            root.mkdir()
+            artifacts = base / "artifacts"
+            artifacts.mkdir()
+            approved = artifacts / "libdirect.so"
+            approved.write_bytes(b"approved direct dependency")
+            rpath_dir = root / "opt/assistant/lib"
+            rpath_dir.mkdir(parents=True)
+            transitive = rpath_dir / "libtransitive.so"
+            transitive.write_bytes(b"Capsule rootfs transitive dependency")
+            obj_path = base / "app"
+            obj_path.write_bytes(b"target")
+            obj = provider("app", obj_path, source="target")
+
+            with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")), mock.patch.object(
+                abi, "elf_soname", return_value="libdirect.so"
+            ):
+                direct, inherited = abi.choose_provider(
+                    "libdirect.so", obj, {"RPATH": "/opt/assistant/lib"}, [], {},
+                    root, {approved.resolve()}, False
+                )
+                self.assertEqual(inherited, [rpath_dir])
+                nested, _ = abi.choose_provider(
+                    "libtransitive.so", direct, {}, inherited, {}, root, set(), False
+                )
+
+            self.assertEqual(nested.physical_path, transitive)
+            self.assertEqual(nested.source, "rootfs-search-path")
+
+    def test_rpath_candidate_precedes_exact_ld_library_path_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "rootfs"
+            root.mkdir()
+            artifacts = base / "artifacts"
+            artifacts.mkdir()
+            approved = artifacts / "libsample.so"
+            approved.write_bytes(b"approved artifact")
+            rpath_dir = base / "rpath"
+            rpath_dir.mkdir()
+            (rpath_dir / "libsample.so").write_bytes(b"unapproved earlier RPATH provider")
+            obj_path = base / "app"
+            obj_path.write_bytes(b"target")
+            obj = provider("app", obj_path, source="target")
+
+            with self.assertRaisesRegex(abi.AuditError, "not an explicitly approved file"):
+                abi.choose_provider(
+                    "libsample.so", obj, {"RPATH": "$ORIGIN/rpath"}, [], {},
+                    root, {approved.resolve()}, False
+                )
+
+    def test_explicit_library_with_mismatched_soname_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            path = base / "libtensorflowlite_c.so"
+            path.write_bytes(b"not actually the TFLite library")
+            with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")), mock.patch.object(
+                abi, "elf_soname", return_value="libdifferent.so"
+            ):
+                with self.assertRaisesRegex(abi.AuditError, "SONAME mismatch"):
+                    abi.external_provider(path, "libtensorflowlite_c.so")
+
+    def test_missing_explicit_library_is_unresolved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            obj_path = root / "tflite_smoke"
+            obj_path.write_bytes(b"smoke")
+            obj = provider("tflite_smoke", obj_path, source="target")
+            with self.assertRaisesRegex(abi.AuditError, "unresolved DT_NEEDED"):
+                abi.choose_provider(
+                    "libtensorflowlite_c.so", obj, {}, [], {}, root, set(), False
+                )
 
     def test_origin_cannot_escape_explicit_external_directory(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -179,14 +409,16 @@ class LoaderPathTests(unittest.TestCase):
             obj_path.write_bytes(b"smoke executable")
             obj = provider("tflite_smoke", obj_path, source="target")
 
-            with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")):
+            with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")), mock.patch.object(
+                abi, "elf_soname", return_value="libtensorflowlite_c.so"
+            ):
                 selected, _ = abi.choose_provider(
-                    "libtensorflowlite_c.so", obj, {"RUNPATH": "$ORIGIN/../_solib_aarch64"}, [], {},
+                    "libtensorflowlite_c.so", obj, {"RPATH": "$ORIGIN/../_solib_aarch64"}, [], {},
                     root, {approved.resolve()}, False
                 )
 
             self.assertEqual(selected.physical_path, approved.resolve())
-            self.assertEqual(selected.source, "explicit-library")
+            self.assertEqual(selected.source, "LD_LIBRARY_PATH[explicit-file]")
 
     @unittest.skipUnless(os.name == "posix", "symlink behavior is exercised on Linux runner")
     def test_bazel_solib_symlink_to_unrelated_library_is_rejected(self):

@@ -151,6 +151,93 @@ def make_provider(name, logical_path, physical_path, source):
     return Provider(name, logical_path, physical_path, digest(physical_path), cls, machine, source)
 
 
+def file_identity(path):
+    info = path.stat()
+    return info.st_dev, info.st_ino
+
+
+def provider_description(provider):
+    try:
+        device, inode = file_identity(provider.physical_path)
+        identity = f"device={device}, inode={inode}"
+    except OSError:
+        identity = "device/inode=unavailable"
+    try:
+        soname = elf_soname(provider.physical_path) or "<no SONAME>"
+    except AuditError:
+        soname = "<unreadable SONAME>"
+    return (
+        f"{provider.logical_path} -> {provider.physical_path} [{identity}; "
+        f"{provider.elf_class}/{provider.machine}; SONAME={soname}; SHA256={provider.sha256}]"
+    )
+
+
+def provider_path_sensitivity(provider):
+    """Return a conservative reason when copies may resolve dependencies differently."""
+    needed, paths = elf_dynamic(provider.physical_path)
+    if any("/" in name or "$" in name for name in needed):
+        return "DT_NEEDED contains a path or dynamic token"
+    for kind, value in paths:
+        for entry in value.split(":"):
+            if "$" in entry:
+                return f"DT_{kind} contains a dynamic path token: {entry!r}"
+            if not os.path.isabs(entry):
+                return f"DT_{kind} contains a non-absolute path: {entry!r}"
+    return None
+
+
+def explain_provider_equivalence(candidates):
+    """Explain whether separate copies may be treated as one ABI provider."""
+    if not candidates:
+        return False, "no candidates"
+    baseline = candidates[0]
+    for candidate in candidates[1:]:
+        if candidate.sha256 != baseline.sha256:
+            return False, "different SHA-256 contents"
+        if (candidate.elf_class, candidate.machine) != (baseline.elf_class, baseline.machine):
+            return False, "different ELF class or machine"
+        if elf_soname(candidate.physical_path) != elf_soname(baseline.physical_path):
+            return False, "different ELF SONAME"
+        for provider in (baseline, candidate):
+            reason = provider_path_sensitivity(provider)
+            if reason:
+                return False, reason
+        if elf_dynamic(candidate.physical_path) != elf_dynamic(baseline.physical_path):
+            return False, "different DT_NEEDED/RPATH/RUNPATH metadata"
+    return True, "identical SHA-256, ELF class/machine, SONAME and dependency metadata; no path-sensitive records"
+
+
+def collapse_provider_candidates(candidates):
+    """Collapse aliases/inodes and prove equivalence for byte-identical copies."""
+    by_inode = {}
+    for candidate in candidates:
+        by_inode.setdefault(file_identity(candidate.physical_path), []).append(candidate)
+    inode_representatives = []
+    inode_path_sensitive = []
+    for group in by_inode.values():
+        paths = {str(item.logical_path) for item in group}
+        reason = provider_path_sensitivity(group[0]) if len(paths) > 1 else None
+        if reason:
+            # Hardlinks share bytes and inode, but the loader may expand
+            # $ORIGIN from the logical lookup path, so retain every path.
+            inode_representatives.extend(sorted(group, key=lambda item: str(item.logical_path)))
+            inode_path_sensitive.append(reason)
+        else:
+            inode_representatives.append(min(group, key=lambda item: str(item.logical_path)))
+    if inode_path_sensitive:
+        return inode_representatives, (
+            "same device/inode reached through distinct load paths, but path-sensitive "
+            f"dynamic metadata prevents merging: {', '.join(sorted(set(inode_path_sensitive)))}"
+        )
+    if len(inode_representatives) <= 1:
+        return inode_representatives, "same physical file (device/inode identity)"
+    equivalent, reason = explain_provider_equivalence(inode_representatives)
+    if equivalent:
+        representative = min(inode_representatives, key=lambda item: str(item.physical_path))
+        return [representative], f"ABI-equivalent copies: {reason}; deterministic representative={representative.physical_path}"
+    return inode_representatives, reason
+
+
 def default_library_dirs(root):
     # Loader search roots, plus common multiarch directories below each root.
     return [
@@ -228,7 +315,7 @@ def index_rootfs(root):
             # Multiple symlink names for the same SONAME and physical object are
             # one provider. Keep distinct physical files separate, even when
             # their bytes happen to be identical.
-            seen_key = (logical_path.name, str(resolved))
+            seen_key = (str(logical_path), str(resolved))
             if seen_key in seen_paths:
                 continue
             seen_paths.add(seen_key)
@@ -246,17 +333,26 @@ def external_provider(path, name):
     try:
         if not path.is_file():
             raise AuditError(f"library search candidate is not a regular file: {path}")
-        return make_provider(name, path, path.resolve(strict=True), "explicit-library")
+        provider = make_provider(name, path, path.resolve(strict=True), "LD_LIBRARY_PATH[explicit-file]")
+        if provider.elf_class != "ELF64" or provider.machine != "AArch64":
+            raise AuditError(f"explicit external provider is not ELF64/AArch64: {path} ({provider.elf_class}/{provider.machine})")
+        declared = elf_soname(provider.physical_path)
+        if declared != name:
+            raise AuditError(f"explicit external provider SONAME mismatch: requested {name}, declared {declared!r} at {path}")
+        return provider
     except OSError as exc:
         raise AuditError(f"cannot inspect library search candidate {path}: {exc}") from exc
 
 
 def mapped_rpath_entries(obj, encoded, root, diagnostics=None):
     entries = []
-    # $ORIGIN is relative to the actual loaded object, after safe rootfs
-    # symlink resolution. Absolute non-$ORIGIN paths, however, belong to the
-    # guest filesystem and must always be rooted at the Capsule rootfs.
-    origin = obj.physical_path.parent
+    # Preserve the path used to find the object: $ORIGIN can differ for two
+    # hardlink/symlink aliases even when both resolve to the same inode.
+    origin = obj.logical_path.parent
+    try:
+        origin_is_rootfs = os.path.commonpath((str(root), str(origin))) == str(root)
+    except ValueError:
+        origin_is_rootfs = False
     for raw in encoded.split(":"):
         if not raw:
             raise AuditError(f"empty RPATH/RUNPATH element in {obj.name}; current-directory lookup is not modeled")
@@ -275,7 +371,7 @@ def mapped_rpath_entries(obj, encoded, root, diagnostics=None):
                 mapped = root / entry.lstrip("/\\")
         else:
             raise AuditError(f"relative RPATH/RUNPATH {raw!r} in {obj.name} cannot be resolved safely")
-        canonical = mapped.resolve(strict=False) if uses_origin else rootfs_resolve(mapped, root)
+        canonical = rootfs_resolve(mapped, root) if (not uses_origin or origin_is_rootfs) else mapped.resolve(strict=False)
         canonical_text = str(canonical) if canonical is not None else "unresolved within Capsule rootfs"
         if diagnostics is not None:
             namespace = "object-relative" if uses_origin else "Capsule-rootfs"
@@ -302,11 +398,10 @@ def choose_provider(soname, obj, own_paths, inherited_rpath, rootfs_index, root,
     tags = dict(own_paths)
     rpath = mapped_rpath_entries(obj, tags["RPATH"], root, diagnostics) if "RPATH" in tags and "RUNPATH" not in tags else []
     runpath = mapped_rpath_entries(obj, tags["RUNPATH"], root, diagnostics) if "RUNPATH" in tags else []
-    if "RUNPATH" in tags:
-        search = list(inherited_rpath) + runpath
-    else:
-        search = rpath + list(inherited_rpath)
-    for directory in search:
+    before_ld_path = rpath + list(inherited_rpath)
+    after_ld_path = runpath
+
+    def find_in_directory(directory):
         try:
             is_rootfs_path = os.path.commonpath((str(root), str(directory))) == str(root)
         except ValueError:
@@ -354,25 +449,55 @@ def choose_provider(soname, obj, own_paths, inherited_rpath, rootfs_index, root,
                     f"{candidate_path} -> {resolved_candidate}"
                 )
         if candidate is not None:
-            child_rpath = rpath + inherited_rpath if "RUNPATH" not in tags else inherited_rpath
-            return candidate, child_rpath
+            return candidate
+        return None
+
+    # Dynamic-loader order: DT_RPATH (when RUNPATH is absent), inherited RPATH,
+    # LD_LIBRARY_PATH, then DT_RUNPATH. --allow-library models only named files
+    # from the configured artifacts LD_LIBRARY_PATH, never an entire directory.
+    for directory in before_ld_path:
+        candidate = find_in_directory(directory)
+        if candidate is not None:
+            return candidate, rpath + inherited_rpath if "RUNPATH" not in tags else inherited_rpath
+
+    for approved_path in sorted(approved_libraries, key=str):
+        if approved_path.name != soname:
+            continue
+        if diagnostics is not None:
+            diagnostics.append(f"LD_LIBRARY_PATH exact-file lookup: {soname} -> {approved_path}")
+        candidate = external_provider(approved_path, soname)
+        if diagnostics is not None:
+            diagnostics.append(f"  ACCEPT explicit provider: {provider_description(candidate)}")
+        return candidate, rpath + inherited_rpath if "RUNPATH" not in tags else inherited_rpath
+
+    for directory in after_ld_path:
+        candidate = find_in_directory(directory)
+        if candidate is not None:
+            return candidate, inherited_rpath
 
     candidates = rootfs_index.get(soname, [])
     if not candidates:
         raise AuditError(f"unresolved DT_NEEDED {soname!r}, required by {obj.name}")
-    candidates_by_physical_path = {}
-    for candidate in candidates:
-        # index_rootfs has already resolved each path inside rootfs. Collapse
-        # symlink aliases of one physical file, but never collapse separate
-        # files just because their contents or ELF headers match.
-        candidates_by_physical_path.setdefault(str(candidate.physical_path), candidate)
-    if len(candidates_by_physical_path) != 1:
-        locations = ", ".join(f"{p.logical_path} [{p.machine}, sha256={p.sha256}]" for p in candidates)
-        raise AuditError(f"ambiguous default-path providers for {soname}: {locations}")
+    if diagnostics is not None and len(candidates) > 1:
+        diagnostics.append(f"ROOTFS provider inventory for {soname}:")
+        diagnostics.extend(f"  VARIANT {provider_description(item)}" for item in candidates)
+    try:
+        collapsed, decision = collapse_provider_candidates(candidates)
+    except AuditError as exc:
+        if diagnostics is not None and len(candidates) > 1:
+            diagnostics.append(f"  DECISION: FAIL CLOSED ({exc})")
+        raise
+    if diagnostics is not None and len(candidates) > 1:
+        diagnostics.append(f"  DECISION: {decision}")
+    if len(collapsed) != 1:
+        locations = "\n".join(f"  {provider_description(item)}" for item in collapsed)
+        raise AuditError(f"ambiguous default-path providers for {soname}: {decision}\n{locations}")
     if unmodeled_loader_state:
         raise AuditError(f"cannot certify default-path choice for {soname}: rootfs has unparsed ld.so.cache/config/preload state")
     child_rpath = rpath + inherited_rpath if "RUNPATH" not in tags else inherited_rpath
-    provider = next(iter(candidates_by_physical_path.values()))
+    provider = collapsed[0]
+    if diagnostics is not None and len(candidates) > 1:
+        diagnostics.append(f"  ACCEPT provider group: {decision}; selected={provider.physical_path}")
     return provider, child_rpath
 
 
