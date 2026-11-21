@@ -22,28 +22,41 @@ jobs:
       - name: Preflight runner
         id: preflight
         run: bash ./scripts/preflight.sh
+      - name: Prepare checksum-verified Capsule OTA root filesystems
+        id: targets
+        if: steps.preflight.outcome == 'success'
+        run: bash ./scripts/prepare-capsule-rootfs.sh
       - name: Build TensorFlow Lite C library
         id: build
-        if: steps.preflight.outcome == 'success'
+        if: steps.targets.outcome == 'success'
         run: bash ./scripts/build-tflite.sh
-      - name: Verify ELF ABI against both Capsule OTA root filesystems
-        id: abi
-        if: steps.build.outcome == 'success'
-        continue-on-error: true
-        run: bash ./scripts/verify-abi.sh
-      - name: Prepare ARM64 inference smoke test
+      - name: Build ARM64 inference smoke executable
         id: smoke_build
         if: steps.build.outcome == 'success'
-        continue-on-error: true
         run: bash ./scripts/prepare-smoke-test.sh
+      - name: Collect actual toolchain and ABI diagnostics
+        id: diagnostics
+        if: steps.build.outcome == 'success' && steps.smoke_build.outcome == 'success'
+        continue-on-error: true
+        run: bash ./scripts/collect-diagnostics.sh
+      - name: Verify TensorFlow Lite library against both Capsule OTA root filesystems
+        id: abi
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        run: bash ./scripts/verify-abi.sh
+      - name: Verify smoke executable against both Capsule OTA root filesystems
+        id: smoke_abi
+        if: steps.smoke_build.outcome == 'success'
+        continue-on-error: true
+        run: bash ./scripts/verify-smoke-abi.sh
       - name: Execute smoke test under QEMU
         id: qemu
-        if: steps.smoke_build.outcome == 'success' && steps.abi.outcome == 'success'
+        if: steps.abi.outcome == 'success' && steps.smoke_abi.outcome == 'success'
         continue-on-error: true
         run: bash ./scripts/run-smoke-test.sh
       - name: Write artifact summary and enforce validation gates
         if: always()
-        run: bash ./scripts/finalize.sh '${{ steps.preflight.outcome }}' '${{ steps.build.outcome }}' '${{ steps.abi.outcome }}' '${{ steps.smoke_build.outcome }}' '${{ steps.qemu.outcome }}'
+        run: bash ./scripts/finalize.sh '${{ steps.preflight.outcome }}' '${{ steps.targets.outcome }}' '${{ steps.build.outcome }}' '${{ steps.smoke_build.outcome }}' '${{ steps.diagnostics.outcome }}' '${{ steps.abi.outcome }}' '${{ steps.smoke_abi.outcome }}' '${{ steps.qemu.outcome }}'
       - name: Upload reviewed outputs only
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -52,14 +65,23 @@ jobs:
           path: |
             artifacts/libtensorflowlite_c.so
             artifacts/tflite_smoke
-            artifacts/elf-reports/**
             artifacts/elf-header.txt
             artifacts/elf-file.txt
+            artifacts/elf-reports/*.txt
             artifacts/SHA256SUMS
             artifacts/preflight.log
+            artifacts/ota-prepare.log
+            artifacts/ota-rootfs-provenance.txt
             artifacts/build.log
             artifacts/abi.log
             artifacts/smoke-build.log
+            artifacts/smoke-abi.log
+            artifacts/diagnostics.log
+            artifacts/toolchain-context.txt
+            artifacts/tensorflow-toolchain-config.txt
+            artifacts/resolved-bazel-toolchain.txt
+            artifacts/toolchain-library-sanitized.txt
+            artifacts/toolchain-smoke-sanitized.txt
             artifacts/qemu.log
             artifacts/README.txt
           if-no-files-found: warn

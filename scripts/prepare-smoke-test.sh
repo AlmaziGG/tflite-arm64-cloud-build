@@ -3,7 +3,7 @@ set -Eeuo pipefail
 source "$(dirname "$0")/common.sh"
 exec > >(tee "$ARTIFACTS/smoke-build.log") 2>&1
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends curl ca-certificates qemu-user
+sudo apt-get install -y --no-install-recommends curl ca-certificates binutils
 model="$WORK/alisa_mww.tflite"
 curl --fail --location --retry 3 "$MODEL_URL" -o "$model"
 require_sha256 "$model" "$MODEL_SHA256"
@@ -53,7 +53,8 @@ cc_binary(
 BUILD
 cd "$tf"
 USE_BAZEL_VERSION="$BAZEL_VERSION" "$WORK/bin/bazelisk" --output_user_root="$WORK/bazel-root" build \
-  --config=elinux_aarch64 -c opt --jobs=2 //tensorflow/lite/c/cloud_smoke:tflite_smoke
+  --config=elinux_aarch64 -c opt --jobs=2 \
+  //tensorflow/lite/c/cloud_smoke:tflite_smoke
 smoke='bazel-bin/tensorflow/lite/c/cloud_smoke/tflite_smoke'
 if [[ ! -s "$smoke" ]]; then
   echo "ERROR: expected non-empty Bazel output at $smoke" >&2
@@ -65,10 +66,4 @@ if [[ ! -s "$smoke" ]]; then
 fi
 install -m 0755 "$smoke" "$ARTIFACTS/tflite_smoke"
 cp "$model" "$WORK/smoke-model.tflite"
-for version in 15 14; do
-  python3 "$ROOT/scripts/verify_elf_abi.py" "$ARTIFACTS/tflite_smoke" "$WORK/ota/capsule$version/rootfs" \
-    --allow-library "$ARTIFACTS/libtensorflowlite_c.so" \
-    | tee "$ARTIFACTS/elf-reports/capsule$version-smoke-abi.txt"
-done
-qemu-aarch64 --version | head -n 1
 readelf -h "$ARTIFACTS/tflite_smoke"

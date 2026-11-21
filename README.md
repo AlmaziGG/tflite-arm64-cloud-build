@@ -28,10 +28,11 @@ Bazelisk `v1.29.0` is downloaded as the official amd64 Debian package and checke
 ## Build and validation sequence
 
 1. Preflight records runner architecture, CPU, available RAM, and free disk, rejects a low-resource runner before the build downloads begin, and runs ABI-auditor regression tests.
-2. Build TensorFlow target `//tensorflow/lite/c:libtensorflowlite_c.so` using the pinned source and `elinux_aarch64` configuration.
-3. Download the two official OTA packages in temporary workspace, check hashes, extract their SquashFS root filesystems, and recursively check ELF `DT_NEEDED`, symbol-version needs, and requested interpreter against each userspace. The workflow reads the rootfs `full_path` from the RKAF partition metadata, logs that row, then verifies that exactly one non-empty `rootfs_dmv.img` exists recursively at the metadata path.
-4. Download and hash-check the Alice model, build a tiny C API smoke executable for the same target, then run it under `qemu-aarch64` with each extracted Capsule userspace.
-5. Upload only the explicit allowlist below, retaining it for seven days.
+2. Download both official OTA packages, check the existing pinned hashes, extract their SquashFS root filesystems using the pinned `afptool-rs` revision, and validate the RKAF metadata `full_path`. This preparation now occurs before compilation so the exact Capsule root filesystems are available for diagnostics. The extraction logic is shared with the later ABI checks; OTA downloads are not uploaded.
+3. Build TensorFlow target `//tensorflow/lite/c:libtensorflowlite_c.so` using the pinned source and unchanged `elinux_aarch64` configuration. Public build logs omit Bazel `--subcommands` and `--verbose_failures`. A later diagnostics step captures CppCompile/CppLink actions and actual compiler/linker evidence privately under the runner workspace, then publishes only a field-allowlisted, redacted toolchain summary. Raw action commands, environment values, and raw toolchain reports are not uploaded or printed to workflow logs.
+4. Download and hash-check the Alice model, build the tiny C API smoke executable for the same target, then run the strict library and smoke ABI audits against both extracted Capsule userspaces. Separate informational reports capture the exact rootfs `libc.so.6` and `libstdc++.so.6` providers, symbol definitions, and dependency chains for all required GLIBC/GLIBCXX versions. Diagnostic reports do not replace or weaken the strict ABI gates.
+5. Run QEMU only after both ELF targets pass both OTA ABI audits. The QEMU step records separate Capsule-15 and Capsule-14 results and still attempts Capsule-14 if the Capsule-15 smoke execution fails.
+6. Generate `SHA256SUMS` over the files under `artifacts/` that are included by the workflow upload allowlist (excluding the manifest itself), then upload that allowlist for seven days. Raw aquery and raw toolchain reports are stored outside `artifacts/` in the runner's private workspace and are not included in the manifest or upload.
 
 The checks are separate gates. A build can succeed while ABI or QEMU validation fails; the workflow will still provide the diagnostics and finish with a failed job conclusion when a required gate fails.
 
@@ -46,12 +47,14 @@ The workflow uploads only:
 - `libtensorflowlite_c.so`;
 - ARM64 `tflite_smoke` executable;
 - ELF ABI reports for both OTA root filesystems;
+- scoped ABI and dependency-chain diagnostics for both OTA root filesystems;
+- sanitized compiler/linker toolchain summaries (`toolchain-library-sanitized.txt` and `toolchain-smoke-sanitized.txt`) with selected compiler path/version, target triple, sysroot assessment, search directories, linker candidate/selection evidence, and toolchain repository identities; raw commands and action environment values are omitted;
 - library ELF header and file-identification reports;
-- SHA-256 manifest;
-- preflight, build, ABI, smoke-build, and QEMU logs;
+- SHA-256 manifest containing only files from the workflow upload allowlist (the manifest itself is excluded);
+- preflight, OTA preparation, build, ABI, smoke-build, smoke-ABI, diagnostics, and QEMU logs;
 - short result summary.
 
-It does **not** upload the OTA packages, extracted root filesystems, Alice model, or Bazel cache. Artifacts and workflow logs are visible to repository users (and to everyone if the repository is public) until retention expires. Download before expiry if needed.
+It does **not** upload raw Bazel aquery files, raw toolchain reports, OTA packages, extracted root filesystems, the Alice model, or Bazel cache. The SHA-256 manifest covers only the published files, so every manifest entry can be checked against the downloaded artifact. Artifacts and workflow logs are visible to repository users (and to everyone if the repository is public) until retention expires. Download before expiry if needed.
 
 GitHub artifact extraction does not preserve Unix executable permissions. After downloading on Linux, run `chmod +x tflite_smoke` before attempting to execute it.
 

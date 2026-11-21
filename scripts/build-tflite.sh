@@ -35,7 +35,8 @@ curl --fail --location --retry 3 "https://github.com/bazelbuild/bazelisk/release
 dpkg-deb -x "$WORK/bazelisk-amd64.deb" "$WORK/bazelisk-package"
 install -m 0755 "$WORK/bazelisk-package/usr/bin/bazelisk" "$WORK/bin/bazelisk"
 USE_BAZEL_VERSION="$BAZEL_VERSION" "$WORK/bin/bazelisk" --output_user_root="$WORK/bazel-root" build \
-  --config=elinux_aarch64 -c opt --jobs=2 --repository_cache="$WORK/repository-cache" \
+  --config=elinux_aarch64 -c opt --jobs=2 \
+  --repository_cache="$WORK/repository-cache" \
   //tensorflow/lite/c:libtensorflowlite_c.so
 lib='bazel-bin/tensorflow/lite/c/libtensorflowlite_c.so'
 if [[ ! -s "$lib" ]]; then
