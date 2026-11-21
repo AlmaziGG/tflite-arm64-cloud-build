@@ -2,9 +2,9 @@
 """Fail-closed ELF dependency/version audit against an extracted ARM64 rootfs.
 
 This is not a complete glibc dynamic-loader emulator. It models explicit
-DT_RPATH/DT_RUNPATH and caller-supplied LD_LIBRARY_PATH directories, checks
-standard rootfs library trees, rejects conflicting providers, and fails when
-an unparsed ld.so.cache could affect a default-path choice.
+DT_RPATH/DT_RUNPATH, permits external resolution only to exact caller-approved
+shared-object files, checks standard rootfs library trees, rejects conflicting
+providers, and fails when unparsed loader state could affect a default choice.
 """
 
 import hashlib
@@ -246,12 +246,12 @@ def external_provider(path, name):
     try:
         if not path.is_file():
             raise AuditError(f"library search candidate is not a regular file: {path}")
-        return make_provider(name, path, path.resolve(strict=True), "LD_LIBRARY_PATH")
+        return make_provider(name, path, path.resolve(strict=True), "explicit-library")
     except OSError as exc:
         raise AuditError(f"cannot inspect library search candidate {path}: {exc}") from exc
 
 
-def mapped_rpath_entries(obj, encoded, root):
+def mapped_rpath_entries(obj, encoded, root, diagnostics=None):
     entries = []
     # $ORIGIN is relative to the actual loaded object, after safe rootfs
     # symlink resolution. Absolute non-$ORIGIN paths, however, belong to the
@@ -268,13 +268,22 @@ def mapped_rpath_entries(obj, encoded, root):
             if uses_origin:
                 # $ORIGIN may legitimately name an explicitly loaded object
                 # under artifacts/, so preserve its actual containing path.
-                entries.append(Path(os.path.abspath(entry)))
+                mapped = Path(os.path.abspath(entry))
             else:
                 # DT_RPATH/DT_RUNPATH is interpreted in the guest namespace,
                 # never as an arbitrary host path on the build runner.
-                entries.append(root / entry.lstrip("/\\"))
+                mapped = root / entry.lstrip("/\\")
         else:
             raise AuditError(f"relative RPATH/RUNPATH {raw!r} in {obj.name} cannot be resolved safely")
+        canonical = mapped.resolve(strict=False) if uses_origin else rootfs_resolve(mapped, root)
+        canonical_text = str(canonical) if canonical is not None else "unresolved within Capsule rootfs"
+        if diagnostics is not None:
+            namespace = "object-relative" if uses_origin else "Capsule-rootfs"
+            diagnostics.append(
+                f"PATH {obj.physical_path}: DT_RPATH/RUNPATH raw={raw!r}; "
+                f"expanded={mapped}; canonical={canonical_text} ({namespace})"
+            )
+        entries.append(mapped)
     return entries
 
 
@@ -289,34 +298,61 @@ def rootfs_candidate(directory, soname, root):
         return Provider(soname, path, resolved, digest(resolved), "invalid", "unknown", "rootfs-search-path")
 
 
-def choose_provider(soname, obj, own_paths, inherited_rpath, rootfs_index, root, external_dirs, unmodeled_loader_state):
+def choose_provider(soname, obj, own_paths, inherited_rpath, rootfs_index, root, approved_libraries, unmodeled_loader_state, diagnostics=None):
     tags = dict(own_paths)
-    rpath = mapped_rpath_entries(obj, tags["RPATH"], root) if "RPATH" in tags and "RUNPATH" not in tags else []
-    runpath = mapped_rpath_entries(obj, tags["RUNPATH"], root) if "RUNPATH" in tags else []
+    rpath = mapped_rpath_entries(obj, tags["RPATH"], root, diagnostics) if "RPATH" in tags and "RUNPATH" not in tags else []
+    runpath = mapped_rpath_entries(obj, tags["RUNPATH"], root, diagnostics) if "RUNPATH" in tags else []
     if "RUNPATH" in tags:
-        search = list(inherited_rpath) + list(external_dirs) + runpath
+        search = list(inherited_rpath) + runpath
     else:
-        search = rpath + list(inherited_rpath) + list(external_dirs)
+        search = rpath + list(inherited_rpath)
     for directory in search:
         try:
             is_rootfs_path = os.path.commonpath((str(root), str(directory))) == str(root)
         except ValueError:
             is_rootfs_path = False
-        if not is_rootfs_path:
-            explicitly_external = False
-            for external_dir in external_dirs:
-                try:
-                    if os.path.commonpath((str(external_dir), str(directory))) == str(external_dir):
-                        explicitly_external = True
-                        break
-                except ValueError:
-                    continue
-            if not explicitly_external:
+        candidate_path = directory / soname
+        if diagnostics is not None:
+            diagnostics.append(
+                f"SEARCH {obj.physical_path}: needed={soname}; directory={directory}; "
+                f"canonical={(rootfs_resolve(directory, root) or 'unresolved within Capsule rootfs') if is_rootfs_path else directory.resolve(strict=False)}; "
+                f"namespace={'Capsule-rootfs' if is_rootfs_path else 'external'}"
+            )
+        if is_rootfs_path:
+            candidate = rootfs_candidate(directory, soname, root)
+            if diagnostics is not None:
+                diagnostics.append(f"  {'ACCEPT' if candidate else 'MISS'} rootfs candidate {candidate_path}")
+        else:
+            # External paths are never trusted as directories. A candidate is
+            # accepted only when its final physical file is one of the explicitly
+            # approved shared objects (for example, the built TFLite DSO).
+            try:
+                resolved_candidate = candidate_path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                if candidate_path.exists() or candidate_path.is_symlink():
+                    if diagnostics is not None:
+                        diagnostics.append(f"  REJECT broken/unresolvable external candidate: {candidate_path}: {exc}")
+                    raise AuditError(f"broken or unresolvable external library candidate {candidate_path}: {exc}") from exc
+                resolved_candidate = None
+            if resolved_candidate is None:
+                candidate = None
+                if diagnostics is not None:
+                    diagnostics.append(f"  SKIP external miss (no physical candidate): {candidate_path}")
+            elif resolved_candidate in approved_libraries:
+                candidate = external_provider(candidate_path, soname)
+                if diagnostics is not None:
+                    diagnostics.append(
+                        f"  ACCEPT exact approved external file: {candidate_path} -> {resolved_candidate}"
+                    )
+            else:
+                if diagnostics is not None:
+                    diagnostics.append(
+                        f"  REJECT external candidate not explicitly approved: {candidate_path} -> {resolved_candidate}"
+                    )
                 raise AuditError(
-                    f"library search path {directory} is outside the Capsule rootfs and "
-                    "all explicitly supplied LD_LIBRARY_PATH directories"
+                    f"external DT_NEEDED candidate is not an explicitly approved file: "
+                    f"{candidate_path} -> {resolved_candidate}"
                 )
-        candidate = rootfs_candidate(directory, soname, root) if is_rootfs_path else external_provider(directory / soname, soname)
         if candidate is not None:
             child_rpath = rpath + inherited_rpath if "RUNPATH" not in tags else inherited_rpath
             return candidate, child_rpath
@@ -364,12 +400,19 @@ def check_versions(obj, soname, provider):
 
 def main(argv):
     if len(argv) < 3:
-        print("usage: verify_elf_abi.py TARGET_ELF ROOTFS [LD_LIBRARY_PATH_DIR ...]", file=sys.stderr)
+        print("usage: verify_elf_abi.py TARGET_ELF ROOTFS [--allow-library FILE ...]", file=sys.stderr)
         return 2
     target = Path(argv[1]).resolve(strict=True)
     root = Path(argv[2]).resolve(strict=True)
-    external_dirs = [Path(p).resolve(strict=True) for p in argv[3:]]
     try:
+        if len(argv[3:]) % 2 or any(argv[index] != "--allow-library" for index in range(3, len(argv), 2)):
+            raise AuditError("external objects must be supplied only as repeated --allow-library FILE pairs")
+        approved_libraries = {Path(argv[index + 1]).resolve(strict=True) for index in range(3, len(argv), 2)}
+        if any(not path.is_file() for path in approved_libraries):
+            raise AuditError("every --allow-library path must resolve to a regular file")
+        print(f"Target ELF: {target}\nCapsule rootfs: {root}")
+        for path in sorted(approved_libraries):
+            print(f"Explicit external library allowlist: {path}")
         target_provider = make_provider(target.name, target, target, "target")
         assert_arm64(target_provider, "target ELF")
         header = run("readelf", "-h", str(target))
@@ -404,6 +447,7 @@ def main(argv):
             queue.append((loader, []))
         visited = set()
         records = []
+        diagnostics = []
         while queue:
             obj, inherited = queue.pop(0)
             key = (str(obj.physical_path), tuple(map(str, inherited)))
@@ -418,7 +462,8 @@ def main(argv):
                 path_tags[kind] = value
             for soname in needed:
                 provider, child_inherited = choose_provider(
-                    soname, obj, path_tags, inherited, rootfs_index, root, external_dirs, unmodeled_loader_state
+                    soname, obj, path_tags, inherited, rootfs_index, root, approved_libraries,
+                    unmodeled_loader_state, diagnostics
                 )
                 assert_arm64(provider, f"provider for {soname}")
                 assert_soname(provider, soname)
@@ -434,10 +479,12 @@ def main(argv):
         else:
             records.append("PT_INTERP: absent (shared object or static ELF)")
 
-        print(f"Target: {target}\nRootfs: {root}\n" + "\n".join(records))
+        print("\n".join(diagnostics + records))
         print("LIMITATION: static dependency audit; it does not fully emulate ld.so, hardware capabilities, loader cache rules, or runtime dlopen().")
         return 0
     except (AuditError, OSError, ValueError) as exc:
+        if "diagnostics" in locals() and diagnostics:
+            print("\n".join(diagnostics))
         print(f"ABI AUDIT FAILED CLOSED: {exc}", file=sys.stderr)
         return 1
 

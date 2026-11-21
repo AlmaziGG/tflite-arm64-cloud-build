@@ -66,8 +66,9 @@ fi
 install -m 0755 "$smoke" "$ARTIFACTS/tflite_smoke"
 cp "$model" "$WORK/smoke-model.tflite"
 for version in 15 14; do
-  python3 "$ROOT/scripts/verify_elf_abi.py" "$ARTIFACTS/tflite_smoke" "$WORK/ota/capsule$version/rootfs" "$ARTIFACTS" \
-    > "$ARTIFACTS/elf-reports/capsule$version-smoke-abi.txt"
+  python3 "$ROOT/scripts/verify_elf_abi.py" "$ARTIFACTS/tflite_smoke" "$WORK/ota/capsule$version/rootfs" \
+    --allow-library "$ARTIFACTS/libtensorflowlite_c.so" \
+    | tee "$ARTIFACTS/elf-reports/capsule$version-smoke-abi.txt"
 done
 qemu-aarch64 --version | head -n 1
 readelf -h "$ARTIFACTS/tflite_smoke"

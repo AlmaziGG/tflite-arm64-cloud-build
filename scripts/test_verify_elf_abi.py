@@ -113,7 +113,7 @@ class LoaderPathTests(unittest.TestCase):
                 [Path(os.path.abspath(actual.parent / "../lib"))],
             )
 
-    def test_only_explicit_artifacts_directory_is_external_search_path(self):
+    def test_only_exact_approved_artifact_is_external_provider(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
             root = base / "capsule-root"
@@ -128,11 +128,12 @@ class LoaderPathTests(unittest.TestCase):
 
             with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")):
                 selected, _ = abi.choose_provider(
-                    "libsample.so", obj, {}, [], {}, root, [artifacts], False
+                    "libsample.so", obj, {"RUNPATH": "$ORIGIN/artifacts"}, [], {},
+                    root, {library.resolve()}, False
                 )
 
             self.assertEqual(selected.physical_path, library.resolve())
-            self.assertEqual(selected.source, "LD_LIBRARY_PATH")
+            self.assertEqual(selected.source, "explicit-library")
 
     def test_origin_cannot_escape_explicit_external_directory(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -148,7 +149,7 @@ class LoaderPathTests(unittest.TestCase):
             obj_path.write_bytes(b"external object")
             obj = provider("libexternal.so", obj_path, source="LD_LIBRARY_PATH")
 
-            with self.assertRaisesRegex(abi.AuditError, "outside the Capsule rootfs"):
+            with self.assertRaisesRegex(abi.AuditError, "not an explicitly approved file"):
                 abi.choose_provider(
                     "libsample.so",
                     obj,
@@ -156,9 +157,104 @@ class LoaderPathTests(unittest.TestCase):
                     [],
                     {},
                     root,
-                    [artifacts],
+                    {obj_path.resolve()},
                     False,
                 )
+
+    @unittest.skipUnless(os.name == "posix", "Bazel solib symlink behavior is exercised on Linux runner")
+    def test_bazel_solib_symlink_to_exact_approved_library_is_allowed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "rootfs"
+            root.mkdir()
+            artifacts = base / "artifacts"
+            artifacts.mkdir()
+            approved = artifacts / "libtensorflowlite_c.so"
+            approved.write_bytes(b"approved shared object")
+            solib = base / "_solib_aarch64"
+            solib.mkdir()
+            alias = solib / "libtensorflowlite_c.so"
+            alias.symlink_to(approved)
+            obj_path = artifacts / "tflite_smoke"
+            obj_path.write_bytes(b"smoke executable")
+            obj = provider("tflite_smoke", obj_path, source="target")
+
+            with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")):
+                selected, _ = abi.choose_provider(
+                    "libtensorflowlite_c.so", obj, {"RUNPATH": "$ORIGIN/../_solib_aarch64"}, [], {},
+                    root, {approved.resolve()}, False
+                )
+
+            self.assertEqual(selected.physical_path, approved.resolve())
+            self.assertEqual(selected.source, "explicit-library")
+
+    @unittest.skipUnless(os.name == "posix", "symlink behavior is exercised on Linux runner")
+    def test_bazel_solib_symlink_to_unrelated_library_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "rootfs"
+            root.mkdir()
+            artifacts = base / "artifacts"
+            artifacts.mkdir()
+            approved = artifacts / "libtensorflowlite_c.so"
+            approved.write_bytes(b"approved")
+            unrelated = base / "libunrelated.so"
+            unrelated.write_bytes(b"host or unexpected provider")
+            solib = base / "_solib_aarch64"
+            solib.mkdir()
+            (solib / "libunrelated.so").symlink_to(unrelated)
+            obj_path = artifacts / "app"
+            obj_path.write_bytes(b"app")
+            obj = provider("app", obj_path, source="target")
+
+            with self.assertRaisesRegex(abi.AuditError, "not an explicitly approved file"):
+                abi.choose_provider(
+                    "libunrelated.so", obj, {"RUNPATH": "$ORIGIN/../_solib_aarch64"}, [], {},
+                    root, {approved.resolve()}, False
+                )
+
+    def test_host_ubuntu_library_is_rejected_even_when_path_is_explicitly_resolved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "rootfs"
+            root.mkdir()
+            artifacts = base / "artifacts"
+            artifacts.mkdir()
+            host_lib = base / "artifacts/usr/lib/libc.so.6"
+            host_lib.parent.mkdir(parents=True)
+            host_lib.write_bytes(b"host Ubuntu libc")
+            obj_path = artifacts / "app"
+            obj_path.write_bytes(b"app")
+            obj = provider("app", obj_path, source="target")
+
+            with self.assertRaisesRegex(abi.AuditError, "not an explicitly approved file"):
+                abi.choose_provider(
+                    "libc.so.6", obj, {"RUNPATH": "$ORIGIN/usr/lib"}, [], {},
+                    root, set(), False
+                )
+
+    def test_absent_runner_workspace_path_is_reported_and_not_searched_for_host_libs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "rootfs"
+            root.mkdir()
+            obj_path = base / "workspace/artifacts/libtensorflowlite_c.so"
+            obj_path.parent.mkdir(parents=True)
+            obj_path.write_bytes(b"target")
+            obj = provider("libtensorflowlite_c.so", obj_path, source="target")
+            diagnostics = []
+            provider_path = root / "usr/lib/libsample.so"
+            provider_path.parent.mkdir(parents=True)
+            provider_path.write_bytes(b"Capsule library")
+            fallback = provider("libsample.so", provider_path)
+            with mock.patch.object(abi, "elf_identity", return_value=("ELF64", "AArch64")):
+                selected, _ = abi.choose_provider(
+                    "libsample.so", obj, {"RUNPATH": "$ORIGIN/.."}, [],
+                    {"libsample.so": [fallback]}, root, set(), False, diagnostics
+                )
+            self.assertEqual(selected.source, "rootfs")
+            self.assertTrue(any("canonical=" in line and "object-relative" in line for line in diagnostics))
+            self.assertTrue(any("SKIP external miss" in line for line in diagnostics))
 
 
 if __name__ == "__main__":

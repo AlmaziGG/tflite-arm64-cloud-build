@@ -64,8 +64,8 @@ for version in 15 14; do
   }
   echo "Capsule-$version RKAF rootfs: $rootfs_image ($(stat -c '%s bytes' "$rootfs_image"))"
   unsquashfs -no-progress -d "$stage/rootfs" "$rootfs_image"
-  python3 "$ROOT/scripts/verify_elf_abi.py" "$ARTIFACTS/libtensorflowlite_c.so" "$stage/rootfs" "$ARTIFACTS" > "$ARTIFACTS/elf-reports/capsule$version-abi.txt"
-  cat "$ARTIFACTS/elf-reports/capsule$version-abi.txt"
+  python3 "$ROOT/scripts/verify_elf_abi.py" "$ARTIFACTS/libtensorflowlite_c.so" "$stage/rootfs" \
+    | tee "$ARTIFACTS/elf-reports/capsule$version-abi.txt"
   readelf -d "$ARTIFACTS/libtensorflowlite_c.so" > "$ARTIFACTS/elf-reports/capsule$version-dynamic.txt"
   readelf --version-info "$ARTIFACTS/libtensorflowlite_c.so" > "$ARTIFACTS/elf-reports/capsule$version-versions.txt"
 done
