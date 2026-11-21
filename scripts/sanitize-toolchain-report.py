@@ -36,16 +36,31 @@ def sanitize(source, destination):
         "Only selected compiler, sysroot, search-path, linker, and toolchain identity fields are included.",
     ]
     action_fields = (
+        "action_target=", "action_source=", "argv_parse_status=",
         "action_launcher_token=", "resolved_action_launcher=", "compiler_wrapper=",
         "actual_compiler=", "explicit_action_sysroot_arguments=",
         "effective_sysroot_assessment=", "compiler_default_configured_sysroot=",
         "wrapper_or_environment_sysroot=", "actual_selected_linker=",
         "CppLink_linker_candidate_path=", "linker_evidence=", "linker_driver_helper=",
+        "compiler_resolution_status=", "effective_sysroot_status=", "linker_resolution_status=",
+        "action_environment_status=", "action_sysroot_status=", "wrapper_dry_run_sysroot_arguments=",
+        "actual_compiler_identification_evidence=", "linker_identification=",
+        "CppLink_action_specific_print_prog_name_token=", "CppLink_action_specific_print_prog_name_exit=",
+        "CppLink_linker_candidate_version_exit=", "actual_linker_version_exit=",
+        "response_file_status=", "compiler_default_sysroot_status=",
+        "compiler_search_directories_status=", "compiler_default_linker_status=",
+        "compiler_metadata_status=", "toolchain_repository_status[",
     )
     for line in lines:
         repo = re.match(r"external_repository\[(local_config_embedded_arm|aarch64_linux_toolchain)\]=(.*)$", line)
         if repo:
             output.append(f"external_repository[{repo.group(1)}]={redact(repo.group(2))}")
+        elif re.match(r"FATAL_DIAGNOSTIC_ERROR=[A-Za-z_]+$", line):
+            output.append(redact(line.strip()))
+        elif line.startswith("diagnostic_status="):
+            output.append(redact(line.strip()))
+        elif re.match(r"toolchain_repository_status\[(local_config_embedded_arm|aarch64_linux_toolchain)\]=", line):
+            output.append(redact(line.strip()))
 
     current_action = None
     metadata_mode = None
@@ -70,6 +85,12 @@ def sanitize(source, destination):
             normalized = line.strip()
             if normalized.startswith(action_fields):
                 output.append(redact(normalized))
+            if normalized.startswith("argv_parse_detail="):
+                # Details are restricted to parser-generated categories, never
+                # the source command line.
+                category = normalized.partition("=")[2]
+                if category in ("unbalanced command quoting", "empty command", "missing command line"):
+                    output.append(f"argv_parse_detail={category}")
             if normalized.startswith("CppLink_linker_candidate_version:"):
                 metadata_mode = "linker_candidate_version"
                 continue

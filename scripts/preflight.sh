@@ -17,4 +17,11 @@ free_kib="$(df -Pk "$WORK" | awk 'NR==2 {print $4}')"
 (( free_kib >= 10*1024*1024 )) || { echo "Insufficient free disk: ${free_kib} KiB (need >=10 GiB)." >&2; exit 1; }
 log 'Running ABI auditor regression tests.'
 python3 "$ROOT/scripts/test_verify_elf_abi.py"
+log 'Checking Python syntax for toolchain diagnostics.'
+PYTHONPYCACHEPREFIX="$WORK/python-bytecode-cache" python3 -m py_compile \
+  "$ROOT/scripts/collect-bazel-toolchain.py" \
+  "$ROOT/scripts/sanitize-toolchain-report.py" \
+  "$ROOT/scripts/test_collect_bazel_toolchain.py"
+log 'Running Bazel toolchain diagnostics regression tests.'
+python3 "$ROOT/scripts/test_collect_bazel_toolchain.py"
 log 'Preflight passed. Thresholds are conservative guards, not TensorFlow minimum requirements.'

@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 
@@ -58,6 +59,8 @@ def split_actions(text):
             "raw": raw, "argv": argv,
             "env_raw": env_raw,
             "env_captured": environment is not None,
+            "target": (re.search(r"(?m)^\s*Target:\s*(.*)$", block) or [None, "<not exposed>"])[1],
+            "record_status": "parsed",
         })
     return found
 
@@ -197,6 +200,59 @@ def compiler_tokens_from_dry_run(output):
     return list(dict.fromkeys(tokens))
 
 
+def linker_selection_from_dry_run(output, action_candidate, resolver, dry_run_succeeded=True):
+    """Resolve an actual linker only from a unique direct linker command in -### output.
+
+    `-print-prog-name=ld` supplies a candidate, never proof. `collect2` is
+    retained as a driver helper and excluded from the actual linker tokens.
+    """
+    lines = [line for line in output.splitlines()
+             if re.search(r"(?:^|[/\\\s\"])(?:[^/\\\s\"]*[-])?ld(?:\.bfd|\.gold|\.lld)?(?:[\s\"]|$)", line)]
+    helpers = [line for line in output.splitlines()
+               if re.search(r"(?:^|[/\\\s\"])(?:[^/\\\s\"]*[/\\])?collect2(?:[\s\"]|$)", line)]
+    tokens = set()
+    for line in lines:
+        try:
+            for item in shlex.split(line, posix=True):
+                base = Path(item).name
+                if (base in ("ld", "ld.bfd", "ld.gold", "ld.lld")
+                        or re.fullmatch(r".+-ld(?:\.bfd|\.gold|\.lld)?", base)):
+                    tokens.add(item)
+        except ValueError:
+            continue
+    resolved = set()
+    unresolved = []
+    for item in tokens:
+        result = resolver(item)
+        if result:
+            resolved.add(result)
+        else:
+            unresolved.append(item)
+    selected = None
+    reason = "no direct linker command found in compiler-driver dry-run"
+    if not dry_run_succeeded:
+        reason = "compiler-driver dry-run returned nonzero"
+    elif lines:
+        if len(resolved) != 1 or unresolved:
+            reason = "dry-run did not resolve exactly one linker executable"
+        else:
+            selected = next(iter(resolved))
+            if action_candidate and selected != action_candidate:
+                reason = "direct dry-run linker differs from the action-specific candidate"
+                selected = None
+            else:
+                reason = "unique direct linker executable in compiler-driver dry-run"
+    return {
+        "lines": lines,
+        "helpers": helpers,
+        "tokens": sorted(tokens),
+        "resolved": resolved,
+        "unresolved": unresolved,
+        "selected": selected,
+        "reason": reason,
+    }
+
+
 def expand_response_files(argv, execution_root, tf_root, output_base, depth=0):
     if depth > 8:
         return argv, ["response-file nesting exceeded limit"]
@@ -327,7 +383,10 @@ def main(argv):
                 toolchain_paths.append(resolved)
             else:
                 print(f"ERROR: external repository {repo_name} not resolved", file=stream)
+                print(f"toolchain_repository_status[{repo_name}]=NOT RESOLVED: repository path not found", file=stream)
                 return_code = 1
+            if resolved:
+                print(f"toolchain_repository_status[{repo_name}]=RESOLVED: generated/external repository path found", file=stream)
 
         actions = split_actions(text)
         drivers = {}
@@ -336,11 +395,17 @@ def main(argv):
             action_list = actions[mnemonic]
             if not action_list:
                 print(f"ERROR: no {mnemonic} actions found in Bazel aquery output", file=stream)
+                print(f"diagnostic_status=NOT RESOLVED: no {mnemonic} action records in aquery output", file=stream)
                 return_code = 1
             for number, action in enumerate(action_list, start=1):
-                print(f"[{mnemonic} #{number}] {action.get('raw', '<unparsed>')}", file=stream)
+                # Raw argv remains private in this report. Public sanitization
+                # consumes only the structured fields below.
+                print(f"[{mnemonic} #{number}]", file=stream)
+                print(f"  action_target={action.get('target', '<not exposed>')}", file=stream)
+                print("  action_source=Bazel text aquery Cpp action", file=stream)
                 if action.get("parse_error"):
-                    print(f"  argv_parse=UNRESOLVED ({action['parse_error']})", file=stream)
+                    print("  argv_parse_status=NOT RESOLVED: command line quoting could not be parsed", file=stream)
+                    print(f"  argv_parse_detail={action['parse_error']}", file=stream)
                     return_code = 1
                     continue
                 environment = parse_action_environment(action.get("env_raw"))
@@ -361,20 +426,28 @@ def main(argv):
                     action["argv"], execution_root, tf_root, output_base
                 )
                 if unresolved_response_files:
+                    print("  response_file_status=NOT RESOLVED: one or more referenced response files could not be read", file=stream)
                     print(f"  response_files_unresolved={unresolved_response_files}", file=stream)
                     return_code = 1
+                else:
+                    print("  response_file_status=RESOLVED: all referenced response files were expanded", file=stream)
                 sysroots = extract_sysroots(expanded_argv)
                 print(f"  explicit_action_sysroot_arguments={sysroots if sysroots else '<none specified>'}", file=stream)
                 print(f"  action_sysroot_status={'explicit action argument(s)' if sysroots else 'no explicit --sysroot/-isysroot argument'}", file=stream)
                 driver = action_driver(action, tf_root, output_base, execution_root, toolchain_paths)
                 if driver is None:
                     print(f"  action_compiler_driver=UNRESOLVED ({action['argv'][0] if action['argv'] else '<empty argv>'})", file=stream)
+                    print("  compiler_resolution_status=NOT RESOLVED: action command has no executable token", file=stream)
                     return_code = 1
                     continue
                 token, launcher, full_argv = driver
                 print(f"  action_launcher_token={token}", file=stream)
                 print(f"  resolved_action_launcher={launcher}", file=stream)
                 if launcher is None:
+                    print("  compiler_resolution_status=NOT RESOLVED: action launcher path could not be resolved in pinned toolchain repositories", file=stream)
+                    print("  effective_sysroot_status=NOT RESOLVED: compiler executable is unknown", file=stream)
+                    if mnemonic == "CppLink":
+                        print("  linker_resolution_status=NOT RESOLVED: CppLink compiler driver is unknown", file=stream)
                     return_code = 1
                     continue
                 cli_environment, clears_environment = launcher_environment(expanded_argv, launcher)
@@ -413,9 +486,12 @@ def main(argv):
                     wrapper_dry_run = None
                     print(f"  actual_compiler={actual_compiler} (direct C++ action executable)", file=stream)
                 if actual_compiler is None:
-                    print("  actual_compiler=UNRESOLVED; wrapper path is not reported as the compiler", file=stream)
+                    print("  actual_compiler=NOT RESOLVED", file=stream)
+                    print("  compiler_resolution_status=NOT RESOLVED: wrapper dry-run did not prove one executable", file=stream)
                     return_code = 1
                 else:
+                    print(f"  actual_compiler={actual_compiler}", file=stream)
+                    print("  compiler_resolution_status=RESOLVED: action executable or wrapper dry-run", file=stream)
                     drivers[(mnemonic, str(actual_compiler), repr(sorted(effective_environment.items()))) ] = (
                         actual_compiler, action, effective_environment, environment_is_captured
                     )
@@ -448,6 +524,10 @@ def main(argv):
                     effective = "compiler default/configured sysroot applies (no wrapper or sysroot override exposed)"
                 print(f"  effective_sysroot_assessment={effective}", file=stream)
                 if effective.startswith("UNRESOLVED"):
+                    print(f"  effective_sysroot_status=NOT RESOLVED: {effective}", file=stream)
+                else:
+                    print("  effective_sysroot_status=RESOLVED from action/wrapper/environment evidence", file=stream)
+                if effective.startswith("UNRESOLVED"):
                     return_code = 1
 
                 if mnemonic == "CppLink":
@@ -456,14 +536,17 @@ def main(argv):
                         [str(launcher), *expanded_argv[1:], "-###"], cwd=execution_root, env=child_env
                     )
                     print(dry_run.stdout.rstrip(), file=stream)
-                    linker_lines = [line for line in dry_run.stdout.splitlines()
-                                    if re.search(r"(?:^|[/\\\s\"])(?:[^/\\\s\"]*[-])?ld(?:\.bfd|\.gold|\.lld)?(?:[\s\"]|$)", line)]
                     print(f"  linker_dry_run_exit={dry_run.returncode}", file=stream)
-                    collect2_lines = [line for line in dry_run.stdout.splitlines()
-                                      if re.search(r"(?:^|[/\\\s\"])(?:[^/\\\s\"]*[/\\])?collect2(?:[\s\"]|$)", line)]
-                    if collect2_lines:
+                    selection = linker_selection_from_dry_run(
+                        dry_run.stdout,
+                        action_linker_path,
+                        lambda item: resolve_executable(item, tf_root, output_base, execution_root, toolchain_paths),
+                        dry_run_succeeded=(dry_run.returncode == 0),
+                    )
+                    linker_lines = selection["lines"]
+                    if selection["helpers"]:
                         print("  linker_driver_helper=collect2 (not the actual linker)", file=stream)
-                        for line in collect2_lines:
+                        for line in selection["helpers"]:
                             print(f"    {line}", file=stream)
 
                     # This action-specific query is always recorded as a
@@ -492,48 +575,29 @@ def main(argv):
                     else:
                         print("  CppLink_linker_candidate_version=UNRESOLVED", file=stream)
 
-                    linker_tokens = set()
-                    for line in linker_lines:
-                        try:
-                            for item in shlex.split(line, posix=True):
-                                base = Path(item).name
-                                if (base in ("ld", "ld.bfd", "ld.gold", "ld.lld")
-                                        or re.fullmatch(r".+-ld(?:\.bfd|\.gold|\.lld)?", base)):
-                                    linker_tokens.add(item)
-                        except ValueError:
-                            continue
-                    resolved_linkers = set()
-                    unresolved_linkers = []
-                    for item in linker_tokens:
-                        linker_path = resolve_executable(item, tf_root, output_base, execution_root, toolchain_paths)
-                        if linker_path:
-                            resolved_linkers.add(linker_path)
-                        else:
-                            unresolved_linkers.append(item)
-
                     if linker_lines:
                         print("  selected_linker_command_lines:", file=stream)
                         for line in linker_lines:
                             print(f"    {line}", file=stream)
-                        if len(resolved_linkers) == 1 and not unresolved_linkers:
-                            selected_linker = next(iter(resolved_linkers))
-                            if action_linker_path and selected_linker != action_linker_path:
-                                print(f"  actual_selected_linker=UNRESOLVED; -### reports {selected_linker}, action-specific driver query reports {action_linker_path}", file=stream)
-                                return_code = 1
-                            else:
-                                print(f"  actual_selected_linker={selected_linker}", file=stream)
-                                print("  linker_evidence=direct linker executable in captured CppLink -### output", file=stream)
+                        if selection["selected"]:
+                            selected_linker = selection["selected"]
+                            print(f"  actual_selected_linker={selected_linker}", file=stream)
+                            print("  linker_evidence=direct linker executable in captured CppLink -### output", file=stream)
                             linker_version = run([str(selected_linker), "--version"])
                             print(linker_version.stdout.rstrip(), file=stream)
                             print(f"  actual_linker_version_exit={linker_version.returncode}", file=stream)
                             if linker_version.returncode:
                                 return_code = 1
                         else:
-                            print(f"  actual_selected_linker=UNRESOLVED; tokens={sorted(linker_tokens)}; unresolved={unresolved_linkers}", file=stream)
+                            print(f"  actual_selected_linker=UNRESOLVED; {selection['reason']}; tokens={selection['tokens']}; unresolved={selection['unresolved']}", file=stream)
+                            print(f"  linker_resolution_status=NOT RESOLVED: {selection['reason']}", file=stream)
                             return_code = 1
                     else:
                         print("  actual_selected_linker=UNRESOLVED; action-specific -print-prog-name=ld is only a candidate, and -### did not prove the selected linker", file=stream)
+                        print("  linker_resolution_status=NOT RESOLVED: action dry-run did not prove a unique invoked linker", file=stream)
                         return_code = 1
+                    if selection["selected"]:
+                        print("  linker_resolution_status=RESOLVED: unique direct linker invocation in action dry-run", file=stream)
                     if dry_run.returncode:
                         print("  WARNING: CppLink dry-run returned nonzero; linker selection is incomplete", file=stream)
                         return_code = 1
@@ -553,6 +617,7 @@ def main(argv):
                 ("target triple", [str(compiler), "-dumpmachine"]),
             ):
                 if log_command(stream, label, args, env=probe_env).returncode:
+                    print(f"compiler_metadata_status=NOT RESOLVED: {label} probe failed", file=stream)
                     return_code = 1
             default_env = probe_env.copy()
             for key in ("SYSROOT", "SDKROOT", "GCC_EXEC_PREFIX", "COMPILER_PATH"):
@@ -563,17 +628,35 @@ def main(argv):
             )
             print(f"compiler_default_configured_sysroot={default_sysroot.stdout.strip() or '<empty>'}", file=stream)
             if default_sysroot.returncode:
+                print("compiler_default_sysroot_status=NOT RESOLVED: -print-sysroot probe failed", file=stream)
                 return_code = 1
+            else:
+                print("compiler_default_sysroot_status=RESOLVED: compiler-reported default/configured value only", file=stream)
             if log_command(stream, "compiler search directories", [str(compiler), "-print-search-dirs"], env=probe_env).returncode:
+                print("compiler_search_directories_status=NOT RESOLVED: probe failed", file=stream)
                 return_code = 1
             reported_linker = log_command(stream, "compiler-reported default linker (informational only; not proof of CppLink selection)",
                                           [str(compiler), "-print-prog-name=ld"], env=probe_env)
             print(f"compiler_reported_default_linker={reported_linker.stdout.strip() or '<empty>'}", file=stream)
             if reported_linker.returncode:
+                print("compiler_default_linker_status=NOT RESOLVED: informational probe failed", file=stream)
                 return_code = 1
         stream.flush()
     return return_code
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    try:
+        raise SystemExit(main(sys.argv))
+    except SystemExit:
+        raise
+    except Exception as exc:  # Keep traceback in the private report only.
+        if len(sys.argv) >= 5:
+            try:
+                with open(sys.argv[4], "a", encoding="utf-8") as report_stream:
+                    print(f"FATAL_DIAGNOSTIC_ERROR={type(exc).__name__}", file=report_stream)
+                    traceback.print_exc(file=report_stream)
+            except OSError:
+                pass
+        print(f"toolchain collector failed ({type(exc).__name__}); private report has details", file=sys.stderr)
+        raise SystemExit(1)
