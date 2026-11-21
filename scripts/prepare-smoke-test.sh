@@ -13,18 +13,15 @@ pkg="$tf/tensorflow/lite/c/cloud_smoke"
 mkdir -p "$pkg"
 cp "$ROOT/scripts/tflite_smoke.c" "$pkg/tflite_smoke.c"
 cp "$ARTIFACTS/libtensorflowlite_c.so" "$pkg/libtensorflowlite_c.so"
-mkdir -p "$pkg/include/tensorflow/lite/c" "$pkg/include/tensorflow/lite/core/c" "$pkg/include/tensorflow/lite/core/async/c"
-find "$tf/tensorflow/lite/c" -maxdepth 1 -type f -name '*.h' -exec cp '{}' "$pkg/include/tensorflow/lite/c/" \;
-find "$tf/tensorflow/lite/core/c" -maxdepth 1 -type f -name '*.h' -exec cp '{}' "$pkg/include/tensorflow/lite/core/c/" \;
-cp "$tf/tensorflow/lite/builtin_ops.h" "$pkg/include/tensorflow/lite/builtin_ops.h"
-cp "$tf/tensorflow/lite/core/async/c/types.h" "$pkg/include/tensorflow/lite/core/async/c/types.h"
-for header in \
-  "$pkg/include/tensorflow/lite/c/c_api.h" \
-  "$pkg/include/tensorflow/lite/core/c/c_api.h" \
-  "$pkg/include/tensorflow/lite/core/c/c_api_types.h" \
-  "$pkg/include/tensorflow/lite/core/c/operator.h" \
-  "$pkg/include/tensorflow/lite/builtin_ops.h" \
-  "$pkg/include/tensorflow/lite/core/async/c/types.h"; do
+headers=(
+  "$tf/tensorflow/lite/c/c_api.h"
+  "$tf/tensorflow/lite/core/c/c_api.h"
+  "$tf/tensorflow/lite/builtin_ops.h"
+  "$tf/tensorflow/lite/core/async/c/types.h"
+  "$tf/tensorflow/lite/core/c/c_api_types.h"
+  "$tf/tensorflow/lite/core/c/operator.h"
+)
+for header in "${headers[@]}"; do
   [[ -s "$header" ]] || { echo "Required pinned TensorFlow C API header missing: $header" >&2; exit 1; }
 done
 cat > "$pkg/BUILD" <<'BUILD'
@@ -35,13 +32,17 @@ cc_import(
 
 cc_library(
     name = "tflite_c_api_headers",
-    hdrs = glob([
-        "include/tensorflow/lite/c/*.h",
-        "include/tensorflow/lite/core/c/*.h",
-        "include/tensorflow/lite/core/async/c/*.h",
-        "include/tensorflow/lite/builtin_ops.h",
-    ]),
-    includes = ["include"],
+    # Declare the exact pinned workspace headers that c_api.h includes
+    # transitively. Their workspace-relative paths match the #include names;
+    # this prevents the compiler from silently using undeclared workspace files.
+    hdrs = [
+        "//tensorflow/lite/c:c_api.h",
+        "//tensorflow/lite/core/c:c_api.h",
+        "//tensorflow/lite:builtin_ops.h",
+        "//tensorflow/lite/core/async/c:types.h",
+        "//tensorflow/lite/core/c:c_api_types.h",
+        "//tensorflow/lite/core/c:operator.h",
+    ],
 )
 
 cc_binary(
