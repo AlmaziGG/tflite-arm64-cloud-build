@@ -13,8 +13,22 @@ git fetch --depth=1 origin "refs/tags/$TF_TAG:refs/tags/$TF_TAG"
 resolved="$(git rev-parse "$TF_TAG^{commit}")"
 [[ "$resolved" == "$TF_COMMIT" ]] || { echo "TensorFlow tag resolved to $resolved, expected $TF_COMMIT" >&2; exit 1; }
 git checkout --detach "$TF_COMMIT"
-actual_bazel="$(tr -d '\r\n ' < .bazelversion)"
-[[ "$actual_bazel" == "$BAZEL_VERSION" ]] || { echo ".bazelversion=$actual_bazel, expected $BAZEL_VERSION" >&2; exit 1; }
+raw_bazel_version="$(cat .bazelversion)"
+actual_bazel="$(printf '%s\n' "$raw_bazel_version" | awk '
+  {
+    sub(/\r$/, "")
+    sub(/#.*/, "")
+    for (i = 1; i <= NF; i++) {
+      print $i
+      exit
+    }
+  }
+')"
+if [[ "$actual_bazel" != "$BAZEL_VERSION" ]]; then
+  printf 'ERROR: .bazelversion does not match the required Bazel version.\nExpected: %s\nRecognized: %s\nOriginal contents:\n%s\n' \
+    "$BAZEL_VERSION" "${actual_bazel:-<empty>}" "$raw_bazel_version" >&2
+  exit 1
+fi
 mkdir -p "$WORK/bin"
 curl --fail --location --retry 3 "https://github.com/bazelbuild/bazelisk/releases/download/$BAZELISK_VERSION/bazelisk-amd64.deb" -o "$WORK/bazelisk-amd64.deb"
 [[ "$(sha256sum "$WORK/bazelisk-amd64.deb" | awk '{print $1}')" == "$BAZELISK_SHA256" ]] || { echo 'Bazelisk package SHA-256 mismatch.' >&2; exit 1; }
