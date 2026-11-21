@@ -1,0 +1,66 @@
+name: Build TensorFlow Lite ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tflite-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Preflight runner
+        id: preflight
+        run: bash ./scripts/preflight.sh
+      - name: Build TensorFlow Lite C library
+        id: build
+        if: steps.preflight.outcome == 'success'
+        run: bash ./scripts/build-tflite.sh
+      - name: Verify ELF ABI against both Capsule OTA root filesystems
+        id: abi
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: bash ./scripts/verify-abi.sh
+      - name: Prepare ARM64 inference smoke test
+        id: smoke_build
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: bash ./scripts/prepare-smoke-test.sh
+      - name: Execute smoke test under QEMU
+        id: qemu
+        if: steps.smoke_build.outcome == 'success' && steps.abi.outcome == 'success'
+        continue-on-error: true
+        run: bash ./scripts/run-smoke-test.sh
+      - name: Write artifact summary and enforce validation gates
+        if: always()
+        run: bash ./scripts/finalize.sh '${{ steps.preflight.outcome }}' '${{ steps.build.outcome }}' '${{ steps.abi.outcome }}' '${{ steps.smoke_build.outcome }}' '${{ steps.qemu.outcome }}'
+      - name: Upload reviewed outputs only
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tflite-arm64-${{ github.run_number }}
+          path: |
+            artifacts/libtensorflowlite_c.so
+            artifacts/tflite_smoke
+            artifacts/elf-reports/**
+            artifacts/elf-header.txt
+            artifacts/elf-file.txt
+            artifacts/SHA256SUMS
+            artifacts/preflight.log
+            artifacts/build.log
+            artifacts/abi.log
+            artifacts/smoke-build.log
+            artifacts/qemu.log
+            artifacts/README.txt
+          if-no-files-found: warn
+          retention-days: 7

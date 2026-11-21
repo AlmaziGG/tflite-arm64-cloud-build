@@ -1,0 +1,5 @@
+/artifacts/
+/work/
+/local-build/
+__pycache__/
+*.py[cod]
