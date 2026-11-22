@@ -148,6 +148,24 @@ class CompatibilityTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     check(records)
 
+    def test_gcc_probes_restore_only_original_missing_source_aliases(self):
+        collector = build.load("collect-bazel-toolchain.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ex, base, tf = (root / name for name in ("execroot", "base", "tensorflow"))
+            ex.mkdir()
+            tf.mkdir()
+            rel = Path("external/dep/kernel.S")
+            (base / rel).parent.mkdir(parents=True)
+            (base / rel).write_bytes(b"assembly")
+            (ex / "external").mkdir()
+            collector.restore_probe_sources(["gcc", "-c", str(rel)], ex, tf, base)
+            self.assertTrue((ex / rel).samefile(base / rel))
+            with self.assertRaises(ValueError):
+                collector.restore_probe_sources(["gcc", "-c", "external/dep/missing.S"], ex, tf, base)
+            with self.assertRaises(ValueError):
+                collector.restore_probe_sources(["gcc", "-c", "bazel-out/generated.c"], ex, tf, base)
+
     def test_guest_opens_require_guest_path_and_all_hashes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "guest"

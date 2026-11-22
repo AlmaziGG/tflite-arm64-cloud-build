@@ -846,6 +846,35 @@ def action_signature(action):
     return (action["configuration_id"], args[0], tuple(relevant), digest)
 
 
+def restore_probe_sources(argv, execroot, workspace, base):
+    """Restore missing source-tree aliases for a dry-run in the original execroot."""
+    for arg in argv:
+        rel = Path(arg)
+        if (arg.startswith("-") or rel.is_absolute() or ".." in rel.parts
+                or rel.suffix not in {".c", ".C", ".cc", ".cpp", ".cxx", ".s", ".S"}):
+            continue
+        logical = execroot / rel
+        if logical.is_file():
+            continue
+        if rel.parts[0] == "bazel-out":
+            raise ValueError("generated compile source missing in execroot")
+        source_root = base if rel.parts[0] == "external" else workspace
+        source = source_root / rel
+        if not source.is_file():
+            raise ValueError("compile source missing from its original workspace or external repository")
+        # Never overwrite a stale alias or write through an existing symlink.
+        for prefix in (*reversed(rel.parents), rel):
+            alias = execroot / prefix
+            if alias.exists():
+                continue
+            if alias.is_symlink() or not alias.parent.resolve().is_relative_to(execroot.resolve()):
+                raise ValueError("unsafe source alias in execroot")
+            alias.symlink_to(source_root / prefix)
+            break
+        if not logical.is_file() or not logical.samefile(source):
+            raise ValueError("failed to recover original compile source identity")
+
+
 def executed_compiles(graph, event_path):
     """Join successful BEP compile events to aquery by their full command line."""
     by_command = {tuple(a["argv"]): a for a in graph}
@@ -1154,6 +1183,8 @@ def main(argv):
                 )
                 print(f"  unreviewed_action_environment_key_names={','.join(unreviewed_environment_keys) if unreviewed_environment_keys else '<none>'}", file=stream)
                 tf2_evidence = []
+                if os.environ.get("CAPSULE_ARMGNU103") == "1" and mnemonic == "CppCompile":
+                    restore_probe_sources(expanded_argv, execution_root, tf_root, output_base)
                 tf2_verified = (unreviewed_environment_keys == ["TF2_BEHAVIOR"] and
                                 not any(child_env.get(k) for k in ("LD_LIBRARY_PATH", "LD_PRELOAD")) and
                                 not is_wrapper and environment_is_captured and not unresolved_response_files and
