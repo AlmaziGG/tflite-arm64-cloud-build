@@ -30,7 +30,7 @@ jobs:
           umask 077
           private_dir="$(mktemp -d "${RUNNER_TEMP}/bazel-jsonproto-private.XXXXXXXX")"
           chmod 700 "$private_dir"
-          printf 'JSONPROTO_PRIVATE_DIR=%s\\n' "$private_dir" >> "$GITHUB_ENV"
+          printf 'JSONPROTO_PRIVATE_DIR=%s\n' "$private_dir" >> "$GITHUB_ENV"
 
       - name: Check inspector Python syntax
         env:
@@ -55,11 +55,11 @@ jobs:
           set -Eeuo pipefail
           umask 077
           source ./scripts/common.sh
-          python3 ./scripts/inspect-bazel-jsonproto.py \\
-            --tensorflow "$WORK/tensorflow" \\
-            --bazel "$WORK/bin/bazelisk" \\
-            --output-user-root "$WORK/bazel-root" \\
-            --private-dir "$JSONPROTO_PRIVATE_DIR" \\
+          python3 ./scripts/inspect-bazel-jsonproto.py \
+            --tensorflow "$WORK/tensorflow" \
+            --bazel "$WORK/bin/bazelisk" \
+            --output-user-root "$WORK/bazel-root" \
+            --private-dir "$JSONPROTO_PRIVATE_DIR" \
             --report "$ARTIFACTS/bazel-jsonproto-structure-report.txt"
 
       - name: Validate report safety and add it to the job summary
@@ -68,7 +68,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          python3 ./scripts/inspect-bazel-jsonproto.py \\
+          python3 ./scripts/inspect-bazel-jsonproto.py \
             --validate-report ./artifacts/bazel-jsonproto-structure-report.txt
           cat ./artifacts/bazel-jsonproto-structure-report.txt >> "$GITHUB_STEP_SUMMARY"
 
