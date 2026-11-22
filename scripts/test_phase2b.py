@@ -45,6 +45,65 @@ class CompatibilityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build.owned(sdk / "link", sdk)
 
+    def test_foreign_second_link_input_is_fatal_even_when_expected_provider_is_present(self):
+        sdk = Path("/sdk")
+        for name in ("libstdc++.so.6.0.29", "crt1.o", "libgcc_s.so.1", "libc-2.35.so", "libpthread.a"):
+            build.p2.check_system_link_input(sdk / name, sdk)
+            with self.assertRaises(ValueError):
+                build.p2.check_system_link_input(Path("/old") / name, sdk)
+
+    def test_six_member_manifest_and_candidate_leak_detection(self):
+        import hashlib
+        import io
+        import zipfile
+        files = {name: b"public\n" for name in (build.p2.REPORT, *build.EXTRA, *build.public.TOOLCHAINS)}
+        def verify(unexpected=False, corrupt=False):
+            entries = files.copy()
+            entries["SHA256SUMS"] = "".join(
+                f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in files.items()).encode()
+            if unexpected:
+                entries["work/private-diagnostics/actions.json"] = b"x"
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as out:
+                for name, data in entries.items():
+                    out.writestr(name, data)
+            data = archive.getvalue()
+            digest = "sha256:" + ("0" * 64 if corrupt else hashlib.sha256(data).hexdigest())
+            with tempfile.TemporaryDirectory() as tmp:
+                build.public.verify_zip(data, digest, Path(tmp), structure=build.p2.REPORT,
+                                        extra_files=build.EXTRA, validate_structure=lambda p: self.assertEqual(p.read_bytes(), b"public\n"))
+        verify()
+        for options in ({"corrupt": True}, {"unexpected": True}):
+            with self.assertRaises(ValueError):
+                verify(**options)
+        for private in (b"raw_command=foo", b"/home/runner/work/execution-root", b"github_pat_secret"):
+            files[build.public.TOOLCHAINS[0]] = private
+            with self.assertRaises(ValueError):
+                verify()
+
+
+    def test_compiler_sysroot_channel_and_directory_identity(self):
+        collector = build.load("collect-bazel-toolchain.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysroot = root / "sysroot"
+            sysroot.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(sysroot)
+            def check(path, warn):
+                compiler = root / "probe"
+                compiler.write_text("#!/bin/sh\ncase \"$1\" in\n"
+                                    "-dumpfullversion) echo 10.3.1;;\n-dumpmachine) echo aarch64-none-linux-gnu;;\n"
+                                    f"-dumpspecs) echo specs;;\n-print-sysroot) echo '{path}'; {warn} >&2;;\n"
+                                    "-\\#\\#\\#) echo '/bin/collect2 -o dummy';;\nesac\n")
+                compiler.chmod(0o700)
+                return collector.compare_tf2_probes(compiler, [str(compiler)], {"TF2_BEHAVIOR": "1"},
+                                                    root, str(sysroot), gcc_version="10.3.1")
+            self.assertTrue(check(alias, "echo warning"))
+            self.assertFalse(check(root, "echo warning"))
+            self.assertFalse(check(alias, 'echo "$TF2_BEHAVIOR"'))
+
+
     def test_real_checksum_rejection(self):
         import subprocess
         with tempfile.TemporaryDirectory() as directory:

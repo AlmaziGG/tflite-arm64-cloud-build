@@ -181,6 +181,14 @@ def firmware_report(number):
                 development=development(root), audits=pairs)
 
 
+def check_system_link_input(item, sdk):
+    # Called on resolved *opened* files from the private GNU ld -t replay.
+    runtime = r"(?:lib(?:c|m|dl|pthread|rt|stdc\+\+|gcc_s|gcc|c_nonshared)(?:-[0-9.]+)?\.(?:so(?:\.[0-9.]+)?|a)|ld-(?:linux-aarch64\.so\.1|[0-9.]+\.so)|(?:[Sgr]?crt1|crt[in]|crtbegin[ST]?|crtendS?)\.o)"
+    if re.fullmatch(runtime, item.name) and not item.is_relative_to(sdk):
+        raise ValueError("actual system linker input outside pinned ARM SDK")
+
+
+
 def toolchain_report(firmwares):
     collector = module("collect-bazel-toolchain.py")
     base = Path((PRIVATE / "bazel-info-output-base.txt").read_text().strip().splitlines()[-1])
@@ -221,6 +229,8 @@ def toolchain_report(firmwares):
                 if name in references:
                     references[name]["reference" if match[2] == "reference to" else "definition"].add(Path(match[1]).name)
             item = (execroot / line).resolve() if line and len(line) < 500 and not re.search(r"\s", line) else None
+            if item and item.is_file() and os.environ.get("CAPSULE_ARMGNU103") == "1":
+                check_system_link_input(item, arm)
             if item and item.is_relative_to(arm) and item.is_file():
                 inputs.add(relative(item, arm))
         checked(inputs, "no toolchain link inputs identified")

@@ -43,7 +43,7 @@ for target in ("library", "smoke"):
     private = Path(f"work/private-diagnostics/toolchain-{target}.txt")
     if private.is_file():
         for line in private.read_text().splitlines():
-            if re.fullmatch(r"tf2_comparison=[-#a-z]+ (different|unsuccessful|unexpected)", line):
+            if re.fullmatch(r"tf2_comparison=[-#a-z]+ (different|unsuccessful|unexpected|foreign-root|different-stderr|equal-stderr|same-directory)", line):
                 print(target, line)
             match = re.match(r"ERROR \[([\w-]+)\]|collector_failure_category=([\w-]+)", line)
             if match:

@@ -121,7 +121,7 @@ def decide_effective_sysroot(explicit_paths, environment_hints, environment_capt
     return default_sysroot, "RESOLVED", "compiler default/configuration under captured no-override action environment"
 
 
-def compare_tf2_probes(driver, argv, env, cwd, default, probe=run, *, gcc_version="11.3.1", evidence=None):
+def compare_tf2_probes(driver, argv, env, cwd, default, probe=None, *, gcc_version="11.3.1", evidence=None):
     """Only called for a direct pinned ARM GCC with one unreviewed key."""
     if env.get("TF2_BEHAVIOR") != "1" or not default:
         return False
@@ -133,7 +133,15 @@ def compare_tf2_probes(driver, argv, env, cwd, default, probe=run, *, gcc_versio
     del without["TF2_BEHAVIOR"]
     for args in (["-dumpfullversion"], ["-dumpmachine"], ["-dumpspecs"],
                  [*argv[1:], "-print-sysroot"], [*argv[1:], "-###"]):
-        pair = [probe([str(driver), *args], cwd=cwd, env=e) for e in (env, without)]
+        if args[-1] == "-print-sysroot" and probe is None:
+            pair = [subprocess.run([str(driver), *args], cwd=cwd, env=e, capture_output=True, text=True)
+                    for e in (env, without)]
+            if pair[0].stderr != pair[1].stderr:
+                return reject(args[-1], "different-stderr")
+            if pair[0].stderr and evidence is not None:
+                evidence.append("-print-sysroot equal-stderr")
+        else:
+            pair = [(probe or run)([str(driver), *args], cwd=cwd, env=e) for e in (env, without)]
         if any(p.returncode or not p.stdout.strip() for p in pair):
             return reject(args[-1], "unsuccessful")
         a, b = (p.stdout.strip() for p in pair)
@@ -147,6 +155,15 @@ def compare_tf2_probes(driver, argv, env, cwd, default, probe=run, *, gcc_versio
             return reject(args[-1], "different")
         expected = {"-dumpfullversion": gcc_version, "-dumpmachine": "aarch64-none-linux-gnu",
                     "-print-sysroot": default}
+        if args[-1] == "-print-sysroot" and a != default:
+            # A relocated SDK can spell the same existing directory via bin/..
+            # or Bazel's external repository symlink. Reject any other root.
+            if not (Path(a).is_absolute() and Path(a).is_dir()
+                    and Path(default).is_dir() and Path(a).samefile(default)):
+                return reject(args[-1], "foreign-root")
+            if evidence is not None:
+                evidence.append("-print-sysroot same-directory")
+            continue
         if args[-1] in expected and a != expected[args[-1]]:
             return reject(args[-1], "unexpected")
     return True

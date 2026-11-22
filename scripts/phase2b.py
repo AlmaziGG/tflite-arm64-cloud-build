@@ -159,6 +159,7 @@ def report():
         private = (p2.PRIVATE / f"toolchain-{target}.txt").read_text()
         ld, = re.findall(r"(?m)^  actual_selected_linker=(.+)$", private)
         summary = compile_info(target, base)
+        summary["sysroot_comparisons"] = sorted(set(re.findall(r"(?m)^tf2_comparison=(-print-sysroot (?:equal-stderr|same-directory))$", private)))
         summary.update(ld=owned(ld, SDK), ld_version=p2.output([ld, "--version"]).splitlines()[0],
                        old_imports=sorted(s for s in p2.symbols(path) if s.partition("@")[0] in OLD),
                        build_id=re.findall(r"Build ID: ([0-9a-f]+)", p2.output(["readelf", "-nW", path])),
