@@ -1,4 +1,3 @@
-import copy
 import io
 import json
 import struct
@@ -127,6 +126,12 @@ class MeasuredTests(unittest.TestCase):
 
     def test_unlisted_trace(self):
         self.docs["raw.trace"]=[];self.check_invalid()
+
+    def test_reject_scores_for_negative_or_private_sample(self):
+        for ota in self.docs[run.FILES[2]].values():
+            for name,row in ota.items():
+                if name.startswith(("n","q")): row["public_scores"]=[0]
+        self.check_invalid()
 
     def test_real_manifest_verifier(self):
         for kind in ("good","checksum","member","digest"):

@@ -7,6 +7,7 @@ from pathlib import Path
 import statistics
 import struct
 import sys
+import wave
 import zipfile
 
 import phase3 as p
@@ -81,6 +82,24 @@ def summary(manifest,results):
                 p95_latency_ms=sorted(lat)[math.ceil(.95*len(lat))-1]/16 if len(lat)>=20 else None)
 
 
+def diagnose_public_miss(item,path,rows,prefix):
+    # The oracle uses independently built ESPMicroSpeechFeatures on the host.
+    # The replay ELF takes its INT8 bytes directly, bypassing the guest frontend.
+    check(item["id"] in s.RECORDINGS and item["label"]=="positive","public diagnostic scope")
+    with wave.open(str(path),"rb") as stream:
+        pcm=stream.readframes(stream.getnframes())
+    golden=p.command([p.P/"oracle"],pcm).stdout
+    check(golden==b"".join(row[:120] for row in rows),"speech oracle RAW/INT8 divergence")
+    inputs=b"".join(golden[i+80:i+120] for i in range(0,len(golden),120))
+    scores=p.command([*prefix,p.P/"replay",p.ref.work/"model"],inputs[:len(inputs)//120*120]).stdout
+    decisions=[struct.unpack_from("<hH",r,120) for r in rows]
+    check(scores==bytes(raw for raw,_ in decisions if raw>=0),"independent speech replay divergence")
+    padded,metrics,e=p.candidate((p.P/"runner").resolve(),["-"],160,bytes(32000)+pcm,prefix)
+    trace=analyze(padded,item["samples"]+16000,metrics[0][2],len(e))
+    return dict(oracle_features_sha256=s.sha(inputs),reference_scores_sha256=s.sha(scores),
+                public_scores=list(scores),public_sums=[total for _,total in decisions],preroll_1s=trace)
+
+
 def measure(n,manifest):
     runner=(p.P/"runner").resolve()
     root=p.ref.work/"ota"/("capsule"+n)/"rootfs"
@@ -99,8 +118,9 @@ def measure(n,manifest):
         for chunk in p.CHUNKS:
             again,_,e=run([path],chunk)
             check(again==rows and e==events,"chunk divergence")
-        if item["intervals"] and item["intervals"][0][0]<12160:
-            import wave
+        if item["label"]=="positive" and not results[name]["events"]:
+            results[name]["miss_diagnostic"]=diagnose_public_miss(item,path,rows,prefix)
+        elif item["intervals"] and item["intervals"][0][0]<12160:
             with wave.open(str(path),"rb") as f: pcm=f.readframes(f.getnframes())
             padded=bytes(32000)+pcm
             other,m,e=run(["-"],160,padded)
@@ -117,7 +137,6 @@ def measure(n,manifest):
               [m[1] for m in metrics]==[len(singles[i][0]) for i in seq],"session dependence")
     continuous=None
     if positives and negatives:
-        import wave
         pieces=[];intervals=[];offset=0
         by_id={r["id"]:r for r in manifest}
         for i in (positives[0],negatives[0],positives[0]):
@@ -139,7 +158,7 @@ def produce():
     identity()
     for n in ("14","15"):
         root=p.ref.work/"ota"/("capsule"+n)/"rootfs"
-        for elf in [p.ref.lib,(p.P/"runner").resolve()]:
+        for elf in [p.ref.lib,(p.P/"runner").resolve(),(p.P/"replay").resolve()]:
             p.audit(elf,root)
     ids=list(s.RECORDINGS)
     if (s.PRIVATE/"q01.wav").exists(): ids.append("q01")
@@ -188,7 +207,19 @@ def validate(docs,commit):
     equivalent(det["14"],det["15"]);equivalent(sessions["14"],sessions["15"])
     for r in manifest:
         d=det["14"][r["id"]].copy()
-        if r["intervals"] and r["intervals"][0][0]<12160: validate_trace(d.pop("preroll_1s"),r["samples"]+16000)
+        if r["label"]=="positive" and not d["events"]:
+            extra=d.pop("miss_diagnostic")
+            check(r["id"] in s.RECORDINGS and set(extra)=={"oracle_features_sha256","reference_scores_sha256",
+                  "public_scores","public_sums","preroll_1s"},"miss diagnostic schema")
+            scores=extra["public_scores"]; totals=extra["public_sums"]
+            check(all(type(v) is int and 0<=v<=255 for v in scores) and len(scores)==d["invokes"] and
+                  s.sha(bytes(scores))==extra["reference_scores_sha256"]==d["outputs_sha256"] and
+                  extra["oracle_features_sha256"]==d["features_sha256"],"reference identity")
+            check(totals==[sum(scores[max(0,(i+1)//3-10):(i+1)//3]) for i in range(d["frames"])] and
+                  s.sha(b"".join(struct.pack("<H",v) for v in totals))==d["sums_sha256"],"window replay")
+            validate_trace(extra["preroll_1s"],r["samples"]+16000)
+        elif r["intervals"] and r["intervals"][0][0]<12160:
+            validate_trace(d.pop("preroll_1s"),r["samples"]+16000)
         validate_trace(d,r["samples"])
     check(lat==summary(manifest,det["14"]),"metrics")
     run=sessions["14"]; positives=[r["id"] for r in manifest if r["label"]=="positive"]
