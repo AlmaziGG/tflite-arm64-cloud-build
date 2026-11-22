@@ -1,5 +1,6 @@
 import unittest
-from phase2c import caps, isa
+import json
+from phase2c import caps, isa, check_report, pins, runtime_pass
 
 
 class ProfileTests(unittest.TestCase):
@@ -17,6 +18,28 @@ class ProfileTests(unittest.TestCase):
     def test_integer_extensions(self):
         self.assertEqual(isa("sdot","v0.4s"), "dotprod")
         self.assertEqual(isa("smmla","v0.4s"), "i8mm")
+
+    def test_missing_caps_fail_closed(self):
+        for raw in ("","caps=garbage","caps=0,0"):
+            with self.assertRaises(ValueError):
+                caps(raw)
+
+    def test_fail_closed_on_sigill_timeout_incomplete_patterns_or_extension(self):
+        row=dict(abi=[0,0,0],smoke_exit=0,probe_exit=0,translated_library_pcs=42,translated_special={},
+                 patterns=[(str(i),str(k),"100") for i in range(2) for k in range(6)])
+        self.assertTrue(runtime_pass(row))
+        for change in ({"abi":[0,1,0]},{"smoke_exit":-4},{"probe_exit":132},{"failure":"TimeoutExpired"},
+                       {"patterns":row["patterns"][:-1]},{"translated_special":{"i8mm":1}},{"translated_library_pcs":0}):
+            self.assertFalse(runtime_pass(dict(row,**change)))
+
+    def test_only_sanitized_reference_evidence_is_publishable(self):
+        doc={"binaries":pins,"firmware":{"14":{},"15":{}}}
+        check_report(json.dumps(doc).encode())
+        for mutated in (dict(doc,binaries={}), dict(doc,private={"argv":[]}),
+                        dict(doc,version="Bearer secret"),dict(doc,firmware={"14":{}}),
+                        dict(doc,firmware={"14":{"trace":"anything"},"15":{}})):
+            with self.assertRaises(ValueError):
+                check_report(json.dumps(mutated).encode())
 
 
 if __name__ == "__main__":

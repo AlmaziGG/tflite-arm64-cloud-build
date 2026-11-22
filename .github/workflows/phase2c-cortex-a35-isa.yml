@@ -36,7 +36,7 @@ jobs:
           bash scripts/prepare-armgnu103.sh
           bash scripts/prepare-capsule-rootfs.sh > "$RUNNER_TEMP/ota-log" 2>&1
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends qemu-user
+          sudo apt-get install -y --no-install-recommends qemu-user llvm
       - name: Compile auxiliary probe
         run: |
           source scripts/common.sh
@@ -54,7 +54,9 @@ jobs:
       - name: Recover kernel names from byte-matched diagnostic link
         run: bash scripts/phase2c-attribution.sh > "$RUNNER_TEMP/symbols-log" 2>&1 || { tail -n 1 "$RUNNER_TEMP/symbols-log" | cut -c1-160; exit 1; }
       - if: ${{ !cancelled() && steps.measure.outcome != 'skipped' }}
-        run: cd public && sha256sum isa.json > SHA256SUMS
+        run: |
+          python3 scripts/phase2c.py public
+          cd public && sha256sum isa.json > SHA256SUMS
       - id: upload
         if: ${{ !cancelled() && hashFiles('public/SHA256SUMS') != '' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f

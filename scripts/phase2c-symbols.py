@@ -68,5 +68,6 @@ for address, item in doc["inventory"].items():
 for n,row in doc["firmware"].items():
     executed={entry[2] for pc in json.loads((work/("pcs"+n)).read_text()) if (entry:=lookup(pc))}
     row["translated_symbols"]=sorted(executed)
+    row["executed_symbols"]=sorted({entry[2] for pc in json.loads((work/("blocks"+n)).read_text()) if (entry:=lookup(pc))})
 doc["function_table"]=owners
 report.write_text(json.dumps(doc,sort_keys=True)+"\n")
