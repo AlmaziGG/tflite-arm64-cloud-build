@@ -8,61 +8,14 @@ import shutil
 import subprocess
 import sys
 import traceback
+import json
+import hashlib
 from pathlib import Path
 
 
 def run(args, *, cwd=None, env=None):
     return subprocess.run(args, cwd=cwd, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, env=env)
-
-
-def split_actions(text):
-    """Return Bazel text-aquery action blocks keyed by Cpp mnemonic."""
-    blocks = re.split(r"(?m)(?=^action ')", text)
-    found = {"CppCompile": [], "CppLink": []}
-    for block in blocks:
-        mnemonic = re.search(r"(?m)^\s*Mnemonic:\s*(CppCompile|CppLink)\s*$", block)
-        command = re.search(r"(?m)^\s*Command Line:\s*(.*)$", block)
-        environment = re.search(r"(?m)^\s*(?:Environment Variables|Environment):\s*(.*)$", block)
-        if not mnemonic or not command:
-            continue
-        raw = command.group(1).strip()
-        # Bazel prints `(exec <argv...>)` in text mode. Strip only this wrapper;
-        # preserve the argument boundaries with shlex below.
-        if raw.startswith("(exec ") and raw.endswith(")"):
-            raw = raw[6:-1]
-        env_raw = None
-        if environment:
-            # In Bazel's text aquery output the environment header is commonly
-            # followed by indented KEY=VALUE lines. Capture the whole section,
-            # stopping at the next action field rather than assuming a single
-            # line. This is needed to see sysroot and compiler-search overrides.
-            env_lines = [environment.group(1)] if environment.group(1).strip() else []
-            for line in block[environment.end():].splitlines():
-                if not line.strip():
-                    if env_lines:
-                        break
-                    continue
-                if not line[:1].isspace() or re.match(r"^\s+[A-Za-z][A-Za-z0-9 _-]*:\s*", line):
-                    break
-                env_lines.append(line.strip())
-            env_raw = "\n".join(env_lines)
-        try:
-            argv = shlex.split(raw, posix=True)
-        except ValueError:
-            found[mnemonic.group(1)].append({
-                "raw": raw, "argv": [], "parse_error": "unbalanced command quoting",
-                "env_raw": env_raw,
-            })
-            continue
-        found[mnemonic.group(1)].append({
-            "raw": raw, "argv": argv,
-            "env_raw": env_raw,
-            "env_captured": environment is not None,
-            "target": (re.search(r"(?m)^\s*Target:\s*(.*)$", block) or [None, "<not exposed>"])[1],
-            "record_status": "parsed",
-        })
-    return found
 
 
 def extract_sysroots(argv):
@@ -85,7 +38,8 @@ def extract_sysroots(argv):
                 continue
             values.append("-isysroot <MISSING_ARGUMENT>")
         elif arg.startswith("-isysroot") and len(arg) > len("-isysroot"):
-            values.append(arg[len("-isysroot"):])
+            value = arg[len("-isysroot"):]
+            values.append(value[1:] if value.startswith("=") else value)
         i += 1
     return values
 
@@ -100,23 +54,6 @@ def extract_sysroots_text(text):
         prefix = match.group(1)
         values.append(f"{prefix}{value}" if prefix.endswith("=") else f"{prefix.strip()} {value}")
     return list(dict.fromkeys(values))
-
-
-def parse_action_environment(raw):
-    """Parse Bazel's textual KEY=VALUE environment list without logging secrets."""
-    if raw is None:
-        return None
-    variables = {}
-    for line in raw.splitlines():
-        line = line.strip().strip("[]")
-        if re.search(r",\s*[A-Za-z_][A-Za-z0-9_]*=", line):
-            for match in re.finditer(r"(?:^|,\s*)([A-Za-z_][A-Za-z0-9_]*)=([^,\]]*)", line):
-                variables[match.group(1)] = match.group(2).strip().strip("'\"")
-            continue
-        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
-        if assignment:
-            variables[assignment.group(1)] = assignment.group(2).strip().strip("'\"")
-    return variables
 
 
 def env_sysroots(environment):
@@ -253,42 +190,6 @@ def linker_selection_from_dry_run(output, action_candidate, resolver, dry_run_su
     }
 
 
-def expand_response_files(argv, execution_root, tf_root, output_base, depth=0):
-    if depth > 8:
-        return argv, ["response-file nesting exceeded limit"]
-    expanded = []
-    unresolved = []
-    for arg in argv:
-        if not arg.startswith("@") or arg == "@":
-            expanded.append(arg)
-            continue
-        response_name = arg[1:]
-        if response_name.startswith("@"):
-            expanded.append(response_name)
-            continue
-        candidate = Path(response_name)
-        probes = [candidate] if candidate.is_absolute() else [
-            execution_root / candidate, tf_root / candidate, output_base / candidate
-        ]
-        response_path = next((path for path in probes if path.is_file()), None)
-        if response_path is None:
-            unresolved.append(response_name)
-            expanded.append(arg)
-            continue
-        try:
-            contents = shlex.split(response_path.read_text(errors="replace"), posix=True)
-        except ValueError:
-            unresolved.append(f"{response_path} (unbalanced quoting)")
-            expanded.append(arg)
-            continue
-        nested, nested_unresolved = expand_response_files(
-            contents, execution_root, tf_root, output_base, depth + 1
-        )
-        expanded.extend(nested)
-        unresolved.extend(nested_unresolved)
-    return expanded, unresolved
-
-
 def resolve_executable(token, tf_root, output_base, execution_root, toolchain_paths):
     candidate = Path(token)
     probes = [candidate] if candidate.is_absolute() else [
@@ -352,14 +253,240 @@ def discover_actual_compiler(launcher, argv, env, cwd, tf_root, output_base, exe
     return None, dry_run, "UNRESOLVED: wrapper dry-run did not prove one compiler", tokens
 
 
+ROOT_LINK_LABELS = {
+    "library": "//tensorflow/lite/c:libtensorflowlite_c.so",
+    "smoke": "//tensorflow/lite/c/cloud_smoke:tflite_smoke",
+}
+RELEVANT_ENVIRONMENT = {
+    "PATH", "CC", "CXX", "LD", "SYSROOT", "SDKROOT", "GCC_EXEC_PREFIX",
+    "COMPILER_PATH", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
+}
+
+
+def validate_action_graph(document):
+    """Validate the Bazel 6.5.0 ActionGraphContainer records used by this tool."""
+    if not isinstance(document, dict):
+        raise ValueError("JSONPROTO root must be an object")
+    actions = document.get("actions")
+    targets = document.get("targets")
+    if not isinstance(actions, list) or not isinstance(targets, list):
+        raise ValueError("JSONPROTO must contain actions and targets arrays")
+    target_labels = {}
+    for target in targets:
+        if (not isinstance(target, dict) or not isinstance(target.get("id"), int)
+                or isinstance(target.get("id"), bool) or not isinstance(target.get("label"), str)):
+            raise ValueError("malformed target record: expected numeric id and string label")
+        if target["id"] in target_labels:
+            raise ValueError(f"duplicate target id {target['id']}")
+        target_labels[target["id"]] = target["label"]
+    normalized = {"CppCompile": [], "CppLink": []}
+    errors = []
+    for index, record in enumerate(actions):
+        if not isinstance(record, dict):
+            errors.append(f"action[{index}] is not an object")
+            continue
+        mnemonic = record.get("mnemonic")
+        if not isinstance(mnemonic, str):
+            errors.append(f"action[{index}] has missing or invalid mnemonic")
+            continue
+        if mnemonic not in normalized:
+            continue
+        action_id = record.get("targetId")
+        if not isinstance(action_id, int) or isinstance(action_id, bool):
+            errors.append(f"action[{index}] has missing or invalid targetId")
+            continue
+        label = target_labels.get(action_id)
+        if label is None:
+            errors.append(f"action[{index}] references unknown targetId {action_id}")
+            continue
+        args = record.get("arguments")
+        if not isinstance(args, list) or not args or not all(isinstance(arg, str) for arg in args):
+            errors.append(f"action[{index}] has missing, empty, or malformed arguments")
+            continue
+        env_records = record.get("environmentVariables", [])
+        if not isinstance(env_records, list):
+            errors.append(f"action[{index}] environmentVariables is not an array")
+            continue
+        environment = {}
+        env_malformed = False
+        for item in env_records:
+            if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not isinstance(item.get("value"), str):
+                env_malformed = True
+                break
+            if item["key"] in environment and environment[item["key"]] != item["value"]:
+                env_malformed = True
+                break
+            environment[item["key"]] = item["value"]
+        if env_malformed:
+            errors.append(f"action[{index}] has malformed environmentVariables records")
+            continue
+        configuration_id = record.get("configurationId")
+        if not isinstance(configuration_id, int) or isinstance(configuration_id, bool):
+            errors.append(f"action[{index}] has missing or invalid configurationId")
+            continue
+        param_files = record.get("paramFiles", [])
+        if not isinstance(param_files, list):
+            errors.append(f"action[{index}] paramFiles is not an array")
+            continue
+        param_map = {}
+        malformed_param = False
+        for item in param_files:
+            if (not isinstance(item, dict) or not isinstance(item.get("execPath"), str) or not item.get("execPath")
+                    or not isinstance(item.get("arguments"), list)
+                    or not all(isinstance(arg, str) for arg in item.get("arguments", []))):
+                malformed_param = True
+                break
+            if item["execPath"] in param_map:
+                malformed_param = True
+                break
+            param_map[item["execPath"]] = item["arguments"]
+        if malformed_param:
+            errors.append(f"action[{index}] has malformed or duplicate paramFiles records")
+            continue
+        expanded, unresolved = expand_jsonproto_param_files(args, param_map)
+        referenced = referenced_param_files(args, param_map)
+        unreferenced = set(param_map) - referenced
+        if unreferenced:
+            unresolved.append("one or more paramFiles records are not referenced by action arguments")
+        normalized[mnemonic].append({
+            "argv": expanded,
+            "target": label,
+            "target_id": action_id,
+            "configuration_id": configuration_id,
+            "environment": environment,
+            "env_captured": "environmentVariables" in record,
+            "param_file_status": "NOT RESOLVED: response-file references or record associations are incomplete" if unresolved else "RESOLVED",
+            "param_file_count": len(param_map),
+            "param_file_reference_count": len(referenced),
+            "param_file_unreferenced_count": len(unreferenced),
+            "action_key": record.get("actionKey") if isinstance(record.get("actionKey", ""), str) else "",
+            "argv_unresolved": unresolved,
+        })
+    return normalized, errors, target_labels
+
+
+def parse_action_graph(text):
+    """Parse JSONPROTO and validate the observed ActionGraphContainer shape."""
+    document = json.loads(text)
+    return validate_action_graph(document)
+
+
+def referenced_param_files(argv, param_files):
+    """Find exact response-file references, including references nested in records."""
+    used = set()
+    pending = list(argv)
+    while pending:
+        item = pending.pop(0)
+        reference = None
+        if item.startswith("@") and len(item) > 1:
+            reference = item[1:]
+        elif item.startswith("--param_file="):
+            reference = item.split("=", 1)[1]
+        elif item in ("--param_file", "--param-file") and pending:
+            reference = pending.pop(0)
+        if reference in param_files and reference not in used:
+            used.add(reference)
+            pending.extend(param_files[reference])
+    return used
+
+
+def expand_jsonproto_param_files(argv, param_files, *, max_depth=8):
+    """Expand only argv references matched exactly to Bazel paramFiles records."""
+    unresolved = []
+
+    def expand(items, stack, depth):
+        if depth > max_depth:
+            unresolved.append("nesting depth exceeded")
+            return list(items)
+        output = []
+        index = 0
+        while index < len(items):
+            item = items[index]
+            reference = None
+            if item.startswith("@") and len(item) > 1:
+                reference = item[1:]
+            elif item.startswith("--param_file="):
+                reference = item.split("=", 1)[1]
+            elif item in ("--param_file", "--param-file"):
+                if index + 1 < len(items):
+                    reference = items[index + 1]
+                    index += 1
+                else:
+                    unresolved.append(f"missing path after {item}")
+                    output.append(item)
+                    index += 1
+                    continue
+            if reference is None:
+                output.append(item)
+                index += 1
+                continue
+            if reference in stack:
+                unresolved.append(f"cycle at {reference}")
+                output.append(item)
+                index += 1
+                continue
+            if reference not in param_files:
+                unresolved.append(f"no paramFiles record for {reference}")
+                output.append(item)
+                index += 1
+                continue
+            output.extend(expand(param_files[reference], stack | {reference}, depth + 1))
+            index += 1
+        return output
+
+    return expand(argv, set(), 0), unresolved
+
+
+def action_signature(action):
+    """Return a conservative toolchain signature, excluding source/output operands."""
+    args = action["argv"]
+    relevant = []
+    prefixes = ("--sysroot=", "-isysroot", "-B", "--gcc-toolchain=", "--target=", "-fuse-ld=",
+                "-march=", "-mcpu=", "-mabi=", "-mfpu=", "-mfloat-abi=", "-stdlib=", "-resource-dir=")
+    for index, arg in enumerate(args[1:], 1):
+        if arg in ("--sysroot", "-isysroot", "-target", "--target", "-B", "--gcc-toolchain",
+                   "-march", "-mcpu", "-mabi", "-mfpu", "-mfloat-abi", "-fuse-ld", "-resource-dir"):
+            relevant.extend(args[index:index + 2])
+        elif arg.startswith(prefixes):
+            relevant.append(arg)
+    env_projection = {key: action["environment"].get(key, "") for key in sorted(RELEVANT_ENVIRONMENT)}
+    digest = hashlib.sha256(json.dumps(env_projection, sort_keys=True).encode()).hexdigest()
+    return (action["configuration_id"], args[0], tuple(relevant), digest)
+
+
+def select_actions(actions, target_name):
+    root_label = ROOT_LINK_LABELS[target_name]
+    links = [item for item in actions["CppLink"] if item["target"] == root_label]
+    compiles = actions["CppCompile"]
+    groups = {}
+    for item in compiles:
+        groups.setdefault(action_signature(item), []).append(item)
+    representatives = []
+    for signature, members in sorted(groups.items(), key=lambda entry: repr(entry[0])):
+        chosen = min(members, key=lambda item: (item["target"], item["action_key"], item["argv"][0]))
+        representatives.append((signature, chosen, len(members)))
+    return links, representatives
+
+
 def main(argv):
-    if len(argv) != 5:
-        print("usage: collect-bazel-toolchain.py ACTIONS TF_ROOT OUTPUT_BASE REPORT", file=sys.stderr)
+    if len(argv) != 6:
+        print("usage: collect-bazel-toolchain.py JSONPROTO TF_ROOT OUTPUT_BASE REPORT TARGET", file=sys.stderr)
         return 2
-    actions_file, tf_root, output_base, report = map(Path, argv[1:])
-    text = actions_file.read_text(errors="replace")
+    actions_file, tf_root, output_base, report = map(Path, argv[1:5])
+    target_name = argv[5]
+    if target_name not in ROOT_LINK_LABELS:
+        print("target must be library or smoke", file=sys.stderr)
+        return 2
+    try:
+        actions, graph_errors, _ = parse_action_graph(actions_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(f"Bazel JSONPROTO toolchain diagnostic\njson_status=NOT RESOLVED ({type(exc).__name__})\n", encoding="utf-8")
+        print(f"JSONPROTO could not be parsed or validated ({type(exc).__name__}); private report has details", file=sys.stderr)
+        return 1
     execution_root = output_base / "execroot" / "org_tensorflow"
-    repo_names = ("local_config_embedded_arm", "aarch64_linux_toolchain")
+    repo_specs = (("generated_repository", "local_config_embedded_arm"),
+                  ("external_repository", "aarch64_linux_toolchain"))
     toolchain_paths = []
     return_code = 0
     with report.open("w", encoding="utf-8") as stream:
@@ -368,14 +495,14 @@ def main(argv):
         print(f"tensorflow_workspace={tf_root.resolve()}", file=stream)
         print(f"bazel_output_base={output_base.resolve()}", file=stream)
         print(f"bazel_execution_root={execution_root.resolve(strict=False)}", file=stream)
-        for repo_name in repo_names:
+        for repo_kind, repo_name in repo_specs:
             candidates = [
                 output_base / "external" / repo_name,
                 execution_root / "external" / repo_name,
                 tf_root / "external" / repo_name,
             ]
             resolved = next((p.resolve() for p in candidates if p.exists()), None)
-            print(f"external_repository[{repo_name}]="
+            print(f"{repo_kind}[{repo_name}]="
                   f"{resolved if resolved else '<UNRESOLVED>'}", file=stream)
             for path in candidates:
                 print(f"  candidate={path} -> {path.resolve(strict=False)}; exists={path.exists()}", file=stream)
@@ -383,18 +510,54 @@ def main(argv):
                 toolchain_paths.append(resolved)
             else:
                 print(f"ERROR: external repository {repo_name} not resolved", file=stream)
-                print(f"toolchain_repository_status[{repo_name}]=NOT RESOLVED: repository path not found", file=stream)
+                print(f"toolchain_repository_status[{repo_kind}:{repo_name}]=NOT RESOLVED: repository path not found", file=stream)
                 return_code = 1
             if resolved:
-                print(f"toolchain_repository_status[{repo_name}]=RESOLVED: generated/external repository path found", file=stream)
+                print(f"toolchain_repository_status[{repo_kind}:{repo_name}]=RESOLVED: repository path found", file=stream)
 
-        actions = split_actions(text)
+        for error in graph_errors:
+            print(f"json_action_graph_error={error}", file=stream)
+            return_code = 1
+        root_links, compile_groups = select_actions(actions, target_name)
+        compile_total = len(actions["CppCompile"])
+        print(f"target_name={target_name}", file=stream)
+        print(f"action_selection_root_link_count={len(root_links)}", file=stream)
+        print(f"action_selection_compile_total={compile_total}", file=stream)
+        print(f"action_selection_cpp_link_total={len(actions['CppLink'])}", file=stream)
+        print(f"action_selection_compile_signature_groups={len(compile_groups)}", file=stream)
+        print("compile_signature_grouping=configurationId,launcher,sysroot/toolchain flags,and hash of relevant environment keys", file=stream)
+        compile_configurations = sorted({item["configuration_id"] for item in actions["CppCompile"]})
+        link_configurations = sorted({item["configuration_id"] for item in root_links})
+        print(f"action_selection_compile_configurations={compile_configurations}", file=stream)
+        print(f"action_selection_root_link_configurations={link_configurations}", file=stream)
+        config_overlap = bool(set(compile_configurations) & set(link_configurations))
+        if set(compile_configurations) == set(link_configurations) and link_configurations:
+            consistency = "CONSISTENT"
+        elif config_overlap:
+            consistency = "MULTIPLE CONFIGURATIONS: compiler groups retained separately; root-link configuration is listed independently"
+        else:
+            consistency = "NOT RESOLVED: no compile configuration matches the root-link configuration"
+        print(f"compile_configuration_consistency={consistency}", file=stream)
+        if not config_overlap:
+            return_code = 1
+        selected = {
+            "CppCompile": [item for _, item, _ in compile_groups],
+            "CppLink": root_links,
+        }
+        for signature, action, member_count in compile_groups:
+            print(f"compile_signature_group_configuration={signature[0]} count={member_count} launcher_token={action['argv'][0]}", file=stream)
+        if compile_total == 0:
+            print("ERROR: no CppCompile actions found for target dependency closure", file=stream)
+            return_code = 1
+        if len(root_links) != 1:
+            print(f"ERROR: expected exactly one CppLink for root label {ROOT_LINK_LABELS[target_name]}; found {len(root_links)}", file=stream)
+            return_code = 1
         drivers = {}
         for mnemonic in ("CppCompile", "CppLink"):
-            print(f"\n=== {mnemonic} action command lines ===", file=stream)
-            action_list = actions[mnemonic]
+            print(f"\n=== {mnemonic} selected JSONPROTO actions ===", file=stream)
+            action_list = selected[mnemonic]
             if not action_list:
-                print(f"ERROR: no {mnemonic} actions found in Bazel aquery output", file=stream)
+                print(f"ERROR: no selected {mnemonic} actions found in Bazel JSONPROTO", file=stream)
                 print(f"diagnostic_status=NOT RESOLVED: no {mnemonic} action records in aquery output", file=stream)
                 return_code = 1
             for number, action in enumerate(action_list, start=1):
@@ -402,13 +565,13 @@ def main(argv):
                 # consumes only the structured fields below.
                 print(f"[{mnemonic} #{number}]", file=stream)
                 print(f"  action_target={action.get('target', '<not exposed>')}", file=stream)
-                print("  action_source=Bazel text aquery Cpp action", file=stream)
-                if action.get("parse_error"):
-                    print("  argv_parse_status=NOT RESOLVED: command line quoting could not be parsed", file=stream)
-                    print(f"  argv_parse_detail={action['parse_error']}", file=stream)
-                    return_code = 1
-                    continue
-                environment = parse_action_environment(action.get("env_raw"))
+                print("  action_source=Bazel 6.5.0 JSONPROTO Cpp action", file=stream)
+                print(f"  action_target_id={action['target_id']}", file=stream)
+                print(f"  action_configuration_id={action['configuration_id']}", file=stream)
+                print(f"  response_file_records={action['param_file_count']}", file=stream)
+                print(f"  response_file_references_matched={action['param_file_reference_count']}", file=stream)
+                print(f"  response_file_records_unreferenced={action['param_file_unreferenced_count']}", file=stream)
+                environment = action["environment"]
                 print(f"  action_environment_status={'captured by aquery' if action.get('env_captured') else 'NOT EXPOSED by aquery; effective sysroot may be unresolved'}", file=stream)
                 if environment is not None:
                     relevant_keys = (
@@ -418,21 +581,19 @@ def main(argv):
                     for key in relevant_keys:
                         if key in environment:
                             print(f"  action_env[{key}]={environment[key]}", file=stream)
-                child_env = None
-                if environment is not None:
-                    child_env = os.environ.copy()
-                    child_env.update(environment)
-                expanded_argv, unresolved_response_files = expand_response_files(
-                    action["argv"], execution_root, tf_root, output_base
-                )
+                child_env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "HOME") if key in os.environ}
+                child_env.update({key: value for key, value in environment.items() if key in RELEVANT_ENVIRONMENT})
+                expanded_argv = action["argv"]
+                unresolved_response_files = action["argv_unresolved"]
                 if unresolved_response_files:
                     print("  response_file_status=NOT RESOLVED: one or more referenced response files could not be read", file=stream)
-                    print(f"  response_files_unresolved={unresolved_response_files}", file=stream)
+                    print(f"  response_files_unresolved_count={len(unresolved_response_files)}", file=stream)
                     return_code = 1
                 else:
-                    print("  response_file_status=RESOLVED: all referenced response files were expanded", file=stream)
+                    print(f"  response_file_status={action['param_file_status']}", file=stream)
                 sysroots = extract_sysroots(expanded_argv)
                 print(f"  explicit_action_sysroot_arguments={sysroots if sysroots else '<none specified>'}", file=stream)
+                print(f"  explicit_action_sysroot_provenance={'JSONPROTO arguments/paramFiles' if sysroots else '<no explicit value>'}", file=stream)
                 print(f"  action_sysroot_status={'explicit action argument(s)' if sysroots else 'no explicit --sysroot/-isysroot argument'}", file=stream)
                 driver = action_driver(action, tf_root, output_base, execution_root, toolchain_paths)
                 if driver is None:
@@ -523,6 +684,15 @@ def main(argv):
                 else:
                     effective = "compiler default/configured sysroot applies (no wrapper or sysroot override exposed)"
                 print(f"  effective_sysroot_assessment={effective}", file=stream)
+                if sysroots:
+                    sysroot_provenance = "JSONPROTO action arguments or matched paramFiles record"
+                elif env_sysroot_values:
+                    sysroot_provenance = "JSONPROTO action environment and/or env launcher assignments"
+                elif is_wrapper and wrapper_sysroots:
+                    sysroot_provenance = "compiler wrapper action dry-run (-###)"
+                else:
+                    sysroot_provenance = "compiler default/configuration probe; effective only under the stated no-override conditions"
+                print(f"  effective_sysroot_provenance={sysroot_provenance}", file=stream)
                 if effective.startswith("UNRESOLVED"):
                     print(f"  effective_sysroot_status=NOT RESOLVED: {effective}", file=stream)
                 else:
@@ -537,21 +707,8 @@ def main(argv):
                     )
                     print(dry_run.stdout.rstrip(), file=stream)
                     print(f"  linker_dry_run_exit={dry_run.returncode}", file=stream)
-                    selection = linker_selection_from_dry_run(
-                        dry_run.stdout,
-                        action_linker_path,
-                        lambda item: resolve_executable(item, tf_root, output_base, execution_root, toolchain_paths),
-                        dry_run_succeeded=(dry_run.returncode == 0),
-                    )
-                    linker_lines = selection["lines"]
-                    if selection["helpers"]:
-                        print("  linker_driver_helper=collect2 (not the actual linker)", file=stream)
-                        for line in selection["helpers"]:
-                            print(f"    {line}", file=stream)
-
-                    # This action-specific query is always recorded as a
-                    # candidate. It is not by itself proof that the linker was
-                    # selected for the captured action.
+                    # Probe the candidate for this exact link action before
+                    # comparing it with the linker proven by the dry-run.
                     action_linker_probe = run(
                         [str(launcher), *expanded_argv[1:], "-print-prog-name=ld"], cwd=execution_root, env=child_env
                     )
@@ -564,7 +721,6 @@ def main(argv):
                     print(f"  CppLink_linker_candidate_path={action_linker_path or '<UNRESOLVED>'}", file=stream)
                     if action_linker_probe.returncode:
                         return_code = 1
-                    candidate_version = None
                     if action_linker_path:
                         candidate_version = run([str(action_linker_path), "--version"])
                         print("  CppLink_linker_candidate_version:", file=stream)
@@ -574,6 +730,17 @@ def main(argv):
                             return_code = 1
                     else:
                         print("  CppLink_linker_candidate_version=UNRESOLVED", file=stream)
+                    selection = linker_selection_from_dry_run(
+                        dry_run.stdout,
+                        action_linker_path,
+                        lambda item: resolve_executable(item, tf_root, output_base, execution_root, toolchain_paths),
+                        dry_run_succeeded=(dry_run.returncode == 0),
+                    )
+                    linker_lines = selection["lines"]
+                    if selection["helpers"]:
+                        print("  linker_driver_helper=collect2 (not the actual linker)", file=stream)
+                        for line in selection["helpers"]:
+                            print(f"    {line}", file=stream)
 
                     if linker_lines:
                         print("  selected_linker_command_lines:", file=stream)
@@ -608,9 +775,9 @@ def main(argv):
             return_code = 1
         for (mnemonic, _, _), (compiler, action, environment, env_captured) in sorted(drivers.items()):
             print(f"\n--- actual compiler used by {mnemonic}: {compiler} ---", file=stream)
-            probe_env = os.environ.copy()
+            probe_env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "HOME") if key in os.environ}
             if env_captured and environment is not None:
-                probe_env.update(environment)
+                probe_env.update({key: value for key, value in environment.items() if key in RELEVANT_ENVIRONMENT})
             for label, args in (
                 ("version", [str(compiler), "--version"]),
                 ("verbose version", [str(compiler), "-v"]),
@@ -620,7 +787,8 @@ def main(argv):
                     print(f"compiler_metadata_status=NOT RESOLVED: {label} probe failed", file=stream)
                     return_code = 1
             default_env = probe_env.copy()
-            for key in ("SYSROOT", "SDKROOT", "GCC_EXEC_PREFIX", "COMPILER_PATH"):
+            for key in ("SYSROOT", "SDKROOT", "GCC_EXEC_PREFIX", "COMPILER_PATH",
+                        "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"):
                 default_env.pop(key, None)
             default_sysroot = log_command(
                 stream, "compiler default/configured sysroot (sysroot-injecting environment cleared; not the action-effective value)",

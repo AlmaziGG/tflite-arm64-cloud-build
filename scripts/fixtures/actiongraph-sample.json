@@ -1,0 +1,69 @@
+{
+  "actions": [
+    {
+      "actionKey": "synthetic-action-key-a",
+      "mnemonic": "CppCompile",
+      "targetId": 2,
+      "configurationId": 10,
+      "arguments": ["tool/bin/aarch64-linux-gnu-gcc", "-DNAME=value with spaces", "-c", "src/lib_unit.c", "-o", "obj/lib_unit.o", "@bazel-out/k8-fastbuild/bin/lib_unit.params"],
+      "environmentVariables": [{"key": "PATH", "value": "tool/bin"}, {"key": "SYSROOT", "value": "/synthetic/sysroot"}],
+      "paramFiles": [{"execPath": "bazel-out/k8-fastbuild/bin/lib_unit.params", "arguments": ["--sysroot", "/synthetic/sysroot", "-march=armv8-a"]}]
+    },
+    {
+      "actionKey": "synthetic-action-key-b",
+      "mnemonic": "CppCompile",
+      "targetId": 4,
+      "configurationId": 20,
+      "arguments": ["tool/bin/aarch64-linux-gnu-gcc", "-c", "src/smoke_unit.c", "-o", "obj/smoke_unit.o", "@bazel-out/k8-fastbuild/bin/smoke_unit.params"],
+      "environmentVariables": [{"key": "PATH", "value": "tool/bin"}],
+      "paramFiles": [{"execPath": "bazel-out/k8-fastbuild/bin/smoke_unit.params", "arguments": ["-isysroot", "/synthetic/sdk", "-mcpu=cortex-a35"]}]
+    },
+    {
+      "actionKey": "synthetic-action-key-c",
+      "mnemonic": "CppCompile",
+      "targetId": 4,
+      "configurationId": 20,
+      "arguments": ["tool/bin/aarch64-linux-gnu-gcc", "-c", "src/smoke_other.c", "-o", "obj/smoke_other.o", "@bazel-out/k8-fastbuild/bin/smoke_other.params"],
+      "environmentVariables": [{"key": "PATH", "value": "tool/bin"}],
+      "paramFiles": [{"execPath": "bazel-out/k8-fastbuild/bin/smoke_other.params", "arguments": ["-isysroot", "/synthetic/sdk", "-mcpu=cortex-a35"]}]
+    },
+    {
+      "actionKey": "synthetic-action-key-d",
+      "mnemonic": "CppLink",
+      "targetId": 2,
+      "configurationId": 10,
+      "arguments": ["tool/bin/aarch64-linux-gnu-g++", "-shared", "-o", "obj/dependency.so", "obj/lib_unit.o"],
+      "environmentVariables": [{"key": "PATH", "value": "tool/bin"}],
+      "paramFiles": []
+    },
+    {
+      "actionKey": "synthetic-action-key-e",
+      "mnemonic": "CppLink",
+      "targetId": 1,
+      "configurationId": 10,
+      "arguments": ["tool/bin/aarch64-linux-gnu-g++", "-shared", "-o", "libtensorflowlite_c.so", "@bazel-out/k8-fastbuild/bin/library_link.params"],
+      "environmentVariables": [{"key": "PATH", "value": "tool/bin"}],
+      "paramFiles": [{"execPath": "bazel-out/k8-fastbuild/bin/library_link.params", "arguments": ["--sysroot=/synthetic/sysroot", "-Wl,--build-id=none", "obj/lib_unit.o"]}]
+    },
+    {
+      "actionKey": "synthetic-action-key-f",
+      "mnemonic": "CppLink",
+      "targetId": 3,
+      "configurationId": 20,
+      "arguments": ["tool/bin/aarch64-linux-gnu-g++", "-o", "tflite_smoke", "obj/smoke_unit.o"],
+      "environmentVariables": [{"key": "PATH", "value": "tool/bin"}],
+      "paramFiles": []
+    }
+  ],
+  "artifacts": [],
+  "configuration": [],
+  "depSetOfFiles": [],
+  "pathFragments": [],
+  "ruleClasses": [],
+  "targets": [
+    {"id": 1, "label": "//tensorflow/lite/c:libtensorflowlite_c.so", "ruleClassId": 1},
+    {"id": 2, "label": "//tensorflow/lite/c:internal_dependency", "ruleClassId": 2},
+    {"id": 3, "label": "//tensorflow/lite/c/cloud_smoke:tflite_smoke", "ruleClassId": 3},
+    {"id": 4, "label": "//tensorflow/lite/c/cloud_smoke:smoke_dependency", "ruleClassId": 4}
+  ]
+}

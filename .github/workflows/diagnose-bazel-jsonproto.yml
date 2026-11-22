@@ -40,6 +40,10 @@ jobs:
       - name: Preflight runner and existing regression tests
         run: bash ./scripts/preflight.sh
 
+      - name: Prepare checksum-verified Capsule OTA root filesystems
+        id: ota
+        run: bash ./scripts/prepare-capsule-rootfs.sh
+
       - name: Build TensorFlow Lite library with pinned toolchain
         run: bash ./scripts/build-tflite.sh
 
@@ -62,6 +66,66 @@ jobs:
             --private-dir "$JSONPROTO_PRIVATE_DIR" \
             --report "$ARTIFACTS/bazel-jsonproto-structure-report.txt"
 
+      - name: Collect production JSONPROTO toolchain diagnostics
+        id: production_diagnostics
+        if: success()
+        continue-on-error: true
+        shell: bash
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/jsonproto-python-cache
+        run: bash ./scripts/collect-diagnostics.sh
+
+      - name: Re-run Python syntax and regression suites
+        if: always()
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/jsonproto-python-cache
+        run: |
+          python3 -m py_compile ./scripts/collect-bazel-toolchain.py ./scripts/sanitize-toolchain-report.py ./scripts/test_collect_bazel_toolchain.py
+          python3 ./scripts/test_verify_elf_abi.py
+          python3 ./scripts/test_collect_bazel_toolchain.py
+
+      - name: Validate sanitized diagnostics and prepare public manifest
+        id: toolchain_report_safety
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          root = Path("artifacts")
+          reports = [root / "toolchain-library-sanitized.txt", root / "toolchain-smoke-sanitized.txt"]
+          forbidden = ("ACTION_SECRET", "Bearer ", "ghp_", "github_pat_", "raw_command=", "action_dump=", "response_file_contents=")
+          for report in reports:
+              if not report.is_file() or report.stat().st_size == 0:
+                  raise SystemExit(f"SANITIZED REPORT CHECK FAILED: {report.name} missing or empty")
+              content = report.read_text(encoding="utf-8")
+              if any(marker.lower() in content.lower() for marker in forbidden):
+                  raise SystemExit(f"SANITIZED REPORT CHECK FAILED: forbidden marker in {report.name}")
+              if re.search(r"(?m)(?:/home/runner/|/tmp/|[A-Za-z]:\\)", content):
+                  raise SystemExit(f"SANITIZED REPORT CHECK FAILED: private path in {report.name}")
+              print(f"SANITIZED REPORT CHECK PASSED: {report.name} ({report.stat().st_size} bytes)")
+          manifest_files = [root / "bazel-jsonproto-structure-report.txt", *reports]
+          for item in manifest_files:
+              if not item.is_file() or item.stat().st_size == 0:
+                  raise SystemExit(f"PUBLIC ARTIFACT INPUT MISSING: {item.name}")
+          import hashlib
+          lines = []
+          for item in manifest_files:
+              digest = hashlib.sha256(item.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {item.name}")
+          (root / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="ascii")
+          print("PUBLIC SHA256SUMS created for exactly the three uploaded reports.")
+          PY
+          cat ./artifacts/toolchain-library-sanitized.txt >> "$GITHUB_STEP_SUMMARY"
+          cat ./artifacts/toolchain-smoke-sanitized.txt >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ steps.production_diagnostics.outcome }}" != success ]]; then
+            printf '\nProduction diagnostics collector outcome: %s (see per-field NOT RESOLVED statuses; this is not an ABI gate).\n' \
+              "${{ steps.production_diagnostics.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '\nProduction diagnostics collector outcome: success.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Validate report safety and add it to the job summary
         id: report_safety
         if: always()
@@ -72,12 +136,16 @@ jobs:
             --validate-report ./artifacts/bazel-jsonproto-structure-report.txt
           cat ./artifacts/bazel-jsonproto-structure-report.txt >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload the single validated structural report
-        if: always() && steps.report_safety.outcome == 'success'
+      - name: Upload validated structural and sanitized reports
+        if: always() && steps.report_safety.outcome == 'success' && steps.toolchain_report_safety.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: bazel-jsonproto-structure-report
-          path: artifacts/bazel-jsonproto-structure-report.txt
+          path: |
+            artifacts/bazel-jsonproto-structure-report.txt
+            artifacts/toolchain-library-sanitized.txt
+            artifacts/toolchain-smoke-sanitized.txt
+            artifacts/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
 
@@ -89,15 +157,28 @@ jobs:
           umask 077
           if [[ -z "${JSONPROTO_PRIVATE_DIR:-}" ]]; then
             echo 'Private diagnostics directory was not created.'
-            exit 0
+          else
+            case "$JSONPROTO_PRIVATE_DIR" in
+              "$RUNNER_TEMP"/bazel-jsonproto-private.*)
+                rm -rf -- "$JSONPROTO_PRIVATE_DIR"
+                echo 'Removed the temporary private diagnostics directory.'
+                ;;
+              *)
+                echo 'Refusing cleanup outside the expected RUNNER_TEMP prefix.' >&2
+                exit 1
+                ;;
+            esac
           fi
-          case "$JSONPROTO_PRIVATE_DIR" in
-            "$RUNNER_TEMP"/bazel-jsonproto-private.*)
-              rm -rf -- "$JSONPROTO_PRIVATE_DIR"
-              echo 'Removed the temporary private diagnostics directory.'
-              ;;
-            *)
-              echo 'Refusing cleanup outside the expected RUNNER_TEMP prefix.' >&2
-              exit 1
-              ;;
-          esac
+          private_toolchain_dir="$(pwd)/work/private-diagnostics"
+          if [[ -d "$private_toolchain_dir" ]]; then
+            case "$private_toolchain_dir" in
+              "$(pwd)/work/private-diagnostics")
+                rm -rf -- "$private_toolchain_dir"
+                echo 'Removed private action JSONPROTO and toolchain reports.'
+                ;;
+              *)
+                echo 'Refusing cleanup outside the private diagnostics workspace.' >&2
+                exit 1
+                ;;
+            esac
+          fi

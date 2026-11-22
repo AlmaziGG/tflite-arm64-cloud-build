@@ -19,12 +19,16 @@ TOKEN_PATTERNS = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"(?i)https?://[^/\s:@]+:[^/@\s]+@"),
 )
+POSIX_PATH = re.compile(r"(?<![A-Za-z0-9:/])/(?!/)(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+")
+WINDOWS_PATH = re.compile(r"(?i)\b[A-Z]:\\(?:[^\s,;]+\\?)*")
 
 
 def redact(value):
     value = SECRET_ASSIGNMENT.sub(lambda match: match.group(1) + match.group(2) + "[REDACTED]", value)
     for pattern in TOKEN_PATTERNS:
         value = pattern.sub("[REDACTED]", value)
+    value = POSIX_PATH.sub("[PRIVATE_PATH]", value)
+    value = WINDOWS_PATH.sub("[PRIVATE_PATH]", value)
     return value
 
 
@@ -32,14 +36,15 @@ def sanitize(source, destination):
     lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
     output = [
         "Sanitized Bazel ARM64 toolchain diagnostics",
-        "Raw action command lines and environment values are intentionally omitted.",
-        "Only selected compiler, sysroot, search-path, linker, and toolchain identity fields are included.",
+        "Raw action command lines, environment values, response-file contents, and private paths are omitted.",
+        "Only allowlisted toolchain identity, status, and version fields are included.",
     ]
     action_fields = (
         "action_target=", "action_source=", "argv_parse_status=",
         "action_launcher_token=", "resolved_action_launcher=", "compiler_wrapper=",
         "actual_compiler=", "explicit_action_sysroot_arguments=",
         "effective_sysroot_assessment=", "compiler_default_configured_sysroot=",
+        "effective_sysroot_provenance=",
         "wrapper_or_environment_sysroot=", "actual_selected_linker=",
         "CppLink_linker_candidate_path=", "linker_evidence=", "linker_driver_helper=",
         "compiler_resolution_status=", "effective_sysroot_status=", "linker_resolution_status=",
@@ -50,16 +55,25 @@ def sanitize(source, destination):
         "response_file_status=", "compiler_default_sysroot_status=",
         "compiler_search_directories_status=", "compiler_default_linker_status=",
         "compiler_metadata_status=", "toolchain_repository_status[",
+        "action_target_id=", "action_configuration_id=", "action_selection_",
+        "response_file_records=", "response_file_references_matched=", "response_file_records_unreferenced=",
+        "compile_signature_group_configuration=", "compile_configuration_consistency=",
     )
     for line in lines:
-        repo = re.match(r"external_repository\[(local_config_embedded_arm|aarch64_linux_toolchain)\]=(.*)$", line)
+        repo = re.match(r"(generated_repository|external_repository)\[(local_config_embedded_arm|aarch64_linux_toolchain)\]=(.*)$", line)
         if repo:
-            output.append(f"external_repository[{repo.group(1)}]={redact(repo.group(2))}")
+            output.append(f"{repo.group(1)}[{repo.group(2)}]=resolved path omitted")
         elif re.match(r"FATAL_DIAGNOSTIC_ERROR=[A-Za-z_]+$", line):
             output.append(redact(line.strip()))
         elif line.startswith("diagnostic_status="):
             output.append(redact(line.strip()))
-        elif re.match(r"toolchain_repository_status\[(local_config_embedded_arm|aarch64_linux_toolchain)\]=", line):
+        elif line.startswith("json_status="):
+            output.append(redact(line.strip()))
+        elif line.startswith(("target_name=", "action_selection_", "compile_configuration_consistency=", "compile_signature_group_configuration=", "compile_signature_grouping=")):
+            output.append(redact(line.strip()))
+        elif line.startswith("json_action_graph_error="):
+            output.append(redact(line.strip()))
+        elif re.match(r"toolchain_repository_status\[(?:generated_repository|external_repository):(?:local_config_embedded_arm|aarch64_linux_toolchain)\]=", line):
             output.append(redact(line.strip()))
 
     current_action = None
@@ -78,13 +92,25 @@ def sanitize(source, destination):
             continue
         metadata = re.match(r"--- actual compiler used by (CppCompile|CppLink): (.+) ---", line)
         if metadata:
-            output.append(f"actual_compiler[{metadata.group(1)}]={redact(metadata.group(2))}")
+            compiler_path = metadata.group(2).split(" ", 1)[0]
+            output.append(f"actual_compiler[{metadata.group(1)}]_executable={Path(compiler_path).name}")
             metadata_mode = None
             continue
         if current_action:
             normalized = line.strip()
             if normalized.startswith(action_fields):
-                output.append(redact(normalized))
+                path_field = re.match(
+                    r"(action_launcher_token|resolved_action_launcher|compiler_wrapper|actual_compiler|actual_selected_linker|CppLink_linker_candidate_path)=(.*)$",
+                    normalized,
+                )
+                if path_field:
+                    value = path_field.group(2).split(" ", 1)[0]
+                    if value and "UNRESOLVED" not in value and value != "<not exposed>":
+                        output.append(f"{path_field.group(1)}_executable={Path(value).name}")
+                    else:
+                        output.append(redact(normalized))
+                else:
+                    output.append(redact(normalized))
             if normalized.startswith("argv_parse_detail="):
                 # Details are restricted to parser-generated categories, never
                 # the source command line.
@@ -117,9 +143,10 @@ def sanitize(source, destination):
                 metadata_mode = None
             continue
         if line.startswith("compiler_default_configured_sysroot="):
-            output.append(redact(line.strip()))
+            output.append("compiler_default_configured_sysroot=" + ("<empty>" if line.partition("=")[2].strip() in ("", "<empty>") else "<value omitted>"))
         elif line.startswith("compiler_reported_default_linker="):
-            output.append(redact(line.strip()))
+            value = line.partition("=")[2].strip()
+            output.append("compiler_reported_default_linker=" + (Path(value).name if value and value != "<empty>" else "<empty>"))
         elif metadata_mode == "compiler_version" and line.strip() and not line.startswith("(exit="):
             output.append(f"compiler_version={redact(line.strip())}")
             metadata_mode = None
