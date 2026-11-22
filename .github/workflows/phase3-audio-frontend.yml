@@ -1,0 +1,71 @@
+name: Phase 3 offline wake word
+on:
+  push:
+    branches: [codex/phase3-audio-frontend-wakeword-20261123]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build_and_validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check base and regressions
+        run: |
+          git merge-base --is-ancestor 24f139c492318b75cc4b83ebf189b6bf3a10a1e5 HEAD
+          git diff --check 24f139c492318b75cc4b83ebf189b6bf3a10a1e5 HEAD
+          python3 -m py_compile scripts/*.py
+          for s in scripts/*.sh; do bash -n "$s"; done
+          ruby -rpsych -e 'Psych.parse_file(ARGV.fetch(0))' .github/workflows/phase3-audio-frontend.yml
+          bash scripts/preflight.sh
+          python3 scripts/test_phase2b.py
+          python3 scripts/test_phase2c.py
+          python3 scripts/test_phase2d.py
+      - name: Verify immutable Phase 2B artifact
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -c 'from sys import path; path.insert(0,"scripts"); import phase2c; phase2c.art.mkdir(exist_ok=True); phase2c.baseline()'
+      - name: Verify SDK and prepare native and cross builds
+        run: |
+          bash scripts/prepare-armgnu103.sh
+          bash scripts/phase3-build.sh
+          python3 scripts/test_phase3.py
+      - name: Prepare both OTA userspaces
+        run: |
+          bash scripts/prepare-capsule-rootfs.sh > "$RUNNER_TEMP/ota-log" 2>&1
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-user
+      - name: Audit both OTAs then compare emulated inference
+        run: python3 scripts/phase3.py
+      - id: upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: phase3-wakeword-evidence
+          path: |
+            public/PHASE-3-REUSE-ASSESSMENT.md
+            public/frontend-equivalence.json
+            public/streaming-results.json
+            public/detection-results.json
+            public/resource-summary.json
+            public/phase3-report.json
+            public/SHA256SUMS
+          if-no-files-found: error
+  verify_artifact:
+    needs: build_and_validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          ARTIFACT_ID: ${{ needs.build_and_validate.outputs.artifact }}
+        run: python3 scripts/phase3.py verify
