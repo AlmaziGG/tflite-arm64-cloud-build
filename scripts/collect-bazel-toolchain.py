@@ -127,16 +127,26 @@ def redirect_link_output(argv, output_path):
     found = []
     index = 0
     while index < len(result):
-        if result[index] == "-o" and index + 1 < len(result):
+        if result[index] == "-o":
+            if index + 1 >= len(result):
+                return None, "found -o without an output operand"
             found.append(index + 1)
             index += 2
             continue
         index += 1
-    if len(found) != 1:
-        return None, f"expected one separated -o output operand; found {len(found)}"
+    if not found:
+        return None, "expected at least one separated -o output operand; found none"
     output_path = Path(output_path)
-    result[found[0]] = str(output_path)
-    output_count = 1
+    # Preserve argument order and the linker's last-output-wins behavior while
+    # ensuring every original output path is replaced by a private probe path.
+    for output_index, operand_index in enumerate(found):
+        if output_index == len(found) - 1:
+            replacement = output_path
+        else:
+            suffix = Path(result[operand_index]).suffix
+            replacement = output_path.parent / f"probe-output-{output_index + 1}{suffix}"
+        result[operand_index] = str(replacement)
+    output_count = len(found)
     extra_output_options = {"-Map", "--Map", "--dependency-file", "-MF", "--out-implib"}
     extra_inline_prefixes = ("-Map=", "--Map=", "--dependency-file=", "--out-implib=")
     extra_wl_names = {"-Map", "--Map", "--dependency-file", "--out-implib"}
@@ -993,6 +1003,11 @@ def main(argv):
                         wrapper_paths.append(value.split("=", 1)[1])
                     elif " " in value:
                         wrapper_paths.append(value.split(" ", 1)[1])
+                unreviewed_environment_keys = sorted(
+                    set(effective_environment)
+                    - (RELEVANT_ENVIRONMENT | {"LANG", "LC_ALL", "HOME", "TMPDIR", "TMP", "TEMP", "PWD", "LD_LIBRARY_PATH", "LD_PRELOAD", "SOURCE_DATE_EPOCH"})
+                )
+                print(f"  unreviewed_action_environment_key_names={','.join(unreviewed_environment_keys) if unreviewed_environment_keys else '<none>'}", file=stream)
                 effective_value, effective_status, sysroot_provenance = decide_effective_sysroot(
                     extract_sysroot_paths(expanded_argv),
                     env_sysroot_values,
@@ -1000,10 +1015,7 @@ def main(argv):
                     (not is_wrapper or launcher.name == "env"),
                     wrapper_paths,
                     default_sysroot if default_sysroot_result == 0 else None,
-                    unknown_environment_keys=sorted(
-                        set(effective_environment)
-                        - (RELEVANT_ENVIRONMENT | {"LANG", "LC_ALL", "HOME", "TMPDIR", "TMP", "TEMP", "PWD", "LD_LIBRARY_PATH", "LD_PRELOAD", "SOURCE_DATE_EPOCH"})
-                    ),
+                    unknown_environment_keys=unreviewed_environment_keys,
                 )
                 effective_identity, effective_normalization = normalize_sysroot_identity(
                     effective_value,

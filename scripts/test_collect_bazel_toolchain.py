@@ -250,9 +250,14 @@ class IntegrationAndSecurityTests(unittest.TestCase):
             ["g++", "-o", "out", "-Wl,-Map,original.map", "a.o"], "/private/probe/probe-output")
         self.assertIn("-Wl,-Map,/private/probe/probe-extra-1.map", redirected_map)
         self.assertIn("2 recognized link output(s) redirected", map_reason)
+        redirected_multiple, multiple_reason = collector.redirect_link_output(
+            ["g++", "-o", "intermediate.so", "-o", "final.so", "a.o"], "/private/probe/final-output")
+        self.assertEqual(redirected_multiple[2], "/private/probe/probe-output-1.so")
+        self.assertEqual(redirected_multiple[4], "/private/probe/final-output")
+        self.assertIn("2 recognized link output(s) redirected", multiple_reason)
         result, reason = collector.redirect_link_output(["g++", "-o", "a", "-o", "b"], "/private/x")
-        self.assertIsNone(result)
-        self.assertIn("found 2", reason)
+        self.assertEqual(result[2], "/private/probe-output-1")
+        self.assertEqual(result[4], "/private/x")
 
     def test_linker_identity_and_aarch64_target_marker(self):
         self.assertEqual(collector.linker_implementation("GNU ld (GNU Binutils) 2.38", "/x/aarch64-linux-ld"), "GNU ld")
@@ -336,6 +341,7 @@ class IntegrationAndSecurityTests(unittest.TestCase):
   effective_sysroot_identity=aarch64_linux_toolchain/aarch64-none-linux-gnu/libc
   effective_sysroot_normalization_status=RELATIVE_TO_PINNED_TOOLCHAIN_ROOT
   effective_sysroot_provenance=compiler default/configuration under captured no-override action environment
+  unreviewed_action_environment_key_names=ZERO_AR_DATE,API_TOKEN,bad-name
   action_env[PATH]=/home/runner/private/tool/bin
   linker_trace_private_file=/home/runner/private/raw-execve.log
 """
@@ -349,6 +355,8 @@ class IntegrationAndSecurityTests(unittest.TestCase):
         self.assertIn("actual_linker_version=GNU ld (GNU Binutils) 2.38.20220708", public)
         self.assertIn("actual_linker_target_architecture=AArch64 supported", public)
         self.assertIn("effective_sysroot_identity=aarch64_linux_toolchain/aarch64-none-linux-gnu/libc", public)
+        self.assertIn("unreviewed_action_environment_key_names=<redacted-key>,ZERO_AR_DATE", public)
+        self.assertNotIn("API_TOKEN", public)
         for forbidden in ("/home/runner/", "raw-execve", "action_env[PATH]", "private/tool"):
             self.assertNotIn(forbidden, public)
 

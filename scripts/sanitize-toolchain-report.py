@@ -55,6 +55,7 @@ def sanitize(source, destination):
         "actual_linker_implementation=", "actual_linker_version=", "actual_linker_target_architecture=",
         "actual_linker_identity_status=",
         "linker_trace_status=", "linker_trace_action_exit=", "linker_trace_output_redirect_status=",
+        "unreviewed_action_environment_key_names=",
         "CppLink_linker_candidate_path=", "linker_driver_helper=",
         "compiler_resolution_status=", "effective_sysroot_status=", "linker_resolution_status=",
         "action_environment_status=", "action_sysroot_status=", "wrapper_dry_run_sysroot_arguments=",
@@ -107,6 +108,19 @@ def sanitize(source, destination):
             continue
         if current_action:
             normalized = line.strip()
+            if normalized.startswith("unreviewed_action_environment_key_names="):
+                raw_names = normalized.partition("=")[2]
+                names = [] if raw_names == "<none>" else raw_names.split(",")
+                safe_names = []
+                for name in names:
+                    if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name) and not re.search(
+                        r"(?i)(token|secret|password|passwd|api[_-]?key|authorization|cookie|credential)", name
+                    ):
+                        safe_names.append(name)
+                    else:
+                        safe_names.append("<redacted-key>")
+                output.append("unreviewed_action_environment_key_names=" + ",".join(sorted(set(safe_names))))
+                continue
             if normalized.startswith(action_fields):
                 path_field = re.match(
                     r"(action_launcher_token|resolved_action_launcher|compiler_wrapper|actual_compiler|actual_selected_linker|actual_linker_observed_execve|CppLink_linker_candidate_path)=(.*)$",
