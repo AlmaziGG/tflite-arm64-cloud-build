@@ -1,7 +1,7 @@
 name: Phase 2D continuous inference
 on:
   push:
-    branches: [codex/phase2d-continuous-inference-validation-20261123]
+    branches: [codex/phase2d-continuous-inference-20261123]
 permissions:
   contents: read
   actions: read
