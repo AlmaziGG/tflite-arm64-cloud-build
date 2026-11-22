@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Record compiler/linker evidence from Bazel's CppCompile and CppLink actions."""
 
+import ast
 import os
 import re
 import shlex
@@ -10,6 +11,7 @@ import sys
 import traceback
 import json
 import hashlib
+import tempfile
 from pathlib import Path
 
 
@@ -42,6 +44,210 @@ def extract_sysroots(argv):
             values.append(value[1:] if value.startswith("=") else value)
         i += 1
     return values
+
+
+def extract_sysroot_paths(argv):
+    """Return only sysroot path operands, preserving their argv order."""
+    values = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in ("--sysroot", "-isysroot"):
+            if index + 1 < len(argv):
+                values.append(argv[index + 1])
+                index += 2
+                continue
+            values.append("<MISSING_ARGUMENT>")
+        elif arg.startswith("--sysroot="):
+            values.append(arg.split("=", 1)[1] or "<EMPTY>")
+        elif arg.startswith("-isysroot="):
+            values.append(arg.split("=", 1)[1] or "<EMPTY>")
+        elif arg.startswith("-isysroot") and len(arg) > len("-isysroot"):
+            values.append(arg[len("-isysroot"):])
+        index += 1
+    return values
+
+
+def normalize_sysroot_identity(value, toolchain_roots, *, base=None):
+    """Return a public-safe sysroot identity without leaking runner paths."""
+    if value == "":
+        return "<empty>", "EMPTY_VALUE"
+    if value in (None, "<EMPTY>", "<MISSING_ARGUMENT>"):
+        return "<unresolved>", "NOT_RESOLVED"
+    path = Path(value)
+    if not path.is_absolute():
+        if base is None:
+            return f"basename:{path.name or '<root>'}", "BASENAME_ONLY_RELATIVE_PATH"
+        path = base / path
+    resolved = path.resolve(strict=False)
+    for name, root in toolchain_roots.items():
+        root_resolved = Path(root).resolve(strict=False)
+        try:
+            relative = resolved.relative_to(root_resolved)
+            suffix = relative.as_posix() or "."
+            return f"{name}/{suffix}", "RELATIVE_TO_PINNED_TOOLCHAIN_ROOT"
+        except ValueError:
+            continue
+    basename = resolved.name or "<root>"
+    return f"basename:{basename}", "BASENAME_ONLY_OUTSIDE_PINNED_TOOLCHAIN_ROOT"
+
+
+def decide_effective_sysroot(explicit_paths, environment_hints, environment_captured,
+                             launcher_is_transparent, wrapper_paths, default_sysroot,
+                             unknown_environment_keys=()):
+    """Conservatively resolve the action sysroot and its evidence source."""
+    if unknown_environment_keys:
+        return None, "NOT RESOLVED", "unreviewed action environment keys may alter compiler/wrapper behavior"
+    wrapper_values = list(dict.fromkeys(wrapper_paths))
+    explicit_values = list(dict.fromkeys(explicit_paths))
+    if wrapper_values:
+        if len(wrapper_values) == 1 and not any(v.startswith("<") for v in wrapper_values):
+            return wrapper_values[0], "RESOLVED", "wrapper dry-run final compiler arguments (-###)"
+        return None, "NOT RESOLVED", "wrapper dry-run exposed conflicting or malformed sysroot arguments"
+    if explicit_values:
+        if len(explicit_values) == 1 and not any(v.startswith("<") for v in explicit_values):
+            if environment_hints:
+                return None, "NOT RESOLVED", "environment/compiler-selection overrides may supersede action sysroot"
+            return explicit_values[0], "RESOLVED", "JSONPROTO action arguments or matched paramFiles"
+        return None, "NOT RESOLVED", "action contains conflicting or malformed explicit sysroot values"
+    if environment_hints:
+        return None, "NOT RESOLVED", "captured environment contains sysroot or compiler-selection overrides"
+    if not environment_captured:
+        return None, "NOT RESOLVED", "Bazel did not expose the action environment"
+    if not launcher_is_transparent:
+        return None, "NOT RESOLVED", "non-transparent compiler wrapper may inject sysroot or specs"
+    if default_sysroot is None:
+        return None, "NOT RESOLVED", "compiler default/configured sysroot probe failed"
+    return default_sysroot, "RESOLVED", "compiler default/configuration under captured no-override action environment"
+
+
+def redirect_link_output(argv, output_path):
+    """Copy link argv while redirecting recognized output files into the probe dir."""
+    result = list(argv)
+    found = []
+    index = 0
+    while index < len(result):
+        if result[index] == "-o" and index + 1 < len(result):
+            found.append(index + 1)
+            index += 2
+            continue
+        index += 1
+    if len(found) != 1:
+        return None, f"expected one separated -o output operand; found {len(found)}"
+    output_path = Path(output_path)
+    result[found[0]] = str(output_path)
+    output_count = 1
+    extra_output_options = {"-Map", "--Map", "--dependency-file", "-MF", "--out-implib"}
+    extra_inline_prefixes = ("-Map=", "--Map=", "--dependency-file=", "--out-implib=")
+    extra_wl_names = {"-Map", "--Map", "--dependency-file", "--out-implib"}
+    next_index = 0
+
+    def private_extra(original):
+        nonlocal next_index
+        next_index += 1
+        suffix = Path(original).suffix
+        return str(output_path.parent / f"probe-extra-{next_index}{suffix}")
+
+    index = 0
+    while index < len(result):
+        arg = result[index]
+        if arg in extra_output_options and index + 1 < len(result):
+            result[index + 1] = private_extra(result[index + 1])
+            output_count += 1
+            index += 2
+            continue
+        matched = next((prefix for prefix in extra_inline_prefixes if arg.startswith(prefix)), None)
+        if matched:
+            result[index] = matched + private_extra(arg[len(matched):])
+            output_count += 1
+            index += 1
+            continue
+        if arg.startswith("-Wl,"):
+            parts = arg.split(",")
+            for part_index in range(1, len(parts)):
+                part = parts[part_index]
+                if part in extra_wl_names and part_index + 1 < len(parts):
+                    parts[part_index + 1] = private_extra(parts[part_index + 1])
+                    output_count += 1
+                    part_index += 1
+                    continue
+                inline = next((name + "=" for name in extra_wl_names if part.startswith(name + "=")), None)
+                if inline:
+                    parts[part_index] = inline + private_extra(part[len(inline):])
+                    output_count += 1
+            result[index] = ",".join(parts)
+        index += 1
+    return result, f"{output_count} recognized link output(s) redirected to private probe paths"
+
+
+def successful_execve_paths(trace_text):
+    """Parse successful execve paths from strace output; arguments stay private."""
+    paths = []
+    pattern = re.compile(r'execve\(("(?:\\.|[^"\\])*"), .*\)\s+=\s+0\s*$')
+    for line in trace_text.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        try:
+            path = ast.literal_eval(match.group(1))
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(path, str):
+            paths.append(path)
+    return paths
+
+
+def resolve_linker_from_execve_trace(trace_text, cwd):
+    """Resolve one linker executable observed in successful execve records."""
+    observed = successful_execve_paths(trace_text)
+    linkers = []
+    helpers = []
+    for item in observed:
+        name = Path(item).name
+        if re.fullmatch(r"(?:[A-Za-z0-9_.+-]+-)?ld(?:\.bfd|\.gold|\.lld)?", name):
+            candidate = Path(item)
+            if not candidate.is_absolute():
+                candidate = Path(cwd) / candidate
+            resolved = candidate.resolve(strict=False)
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                linkers.append((item, str(resolved)))
+        elif name == "collect2" or name.endswith("/collect2"):
+            helpers.append(item)
+    unique = {real for _, real in linkers}
+    if len(unique) == 1:
+        actual = next(iter(unique))
+        observed_path = next((seen for seen, real in linkers if real == actual), actual)
+        return {"selected": actual, "observed": observed_path, "helpers": helpers,
+                "linker_paths": sorted(unique), "reason": "one linker executable observed in successful execve trace"}
+    if len(unique) > 1:
+        reason = "trace observed multiple distinct linker executables"
+    elif observed:
+        reason = "trace completed but no recognized linker executable was observed"
+    else:
+        reason = "trace contained no parseable successful execve records"
+    return {"selected": None, "observed": None, "helpers": helpers,
+            "linker_paths": sorted(unique), "reason": reason}
+
+
+def linker_implementation(version_text, executable):
+    text = version_text.lower()
+    name = Path(executable).name.lower()
+    if "lld" in text or name.endswith("ld.lld"):
+        return "LLVM LLD"
+    if "gold" in text or name.endswith("ld.gold"):
+        return "GNU gold"
+    if "gnu ld" in text or "gnu binutils" in text or name.endswith(("-ld", "ld", "ld.bfd")):
+        return "GNU ld"
+    return "UNRESOLVED"
+
+
+def linker_target_architecture(version_output):
+    return "AArch64 supported" if re.search(r"aarch64", version_output, re.I) else "not confirmed by linker -V"
+
+
+def diagnostic_exit_code(existing_code, failure_categories):
+    """Critical diagnostic findings can never be converted into SUCCESS."""
+    return 1 if existing_code or failure_categories else 0
 
 
 def extract_sysroots_text(text):
@@ -103,6 +309,26 @@ def launcher_environment(argv, launcher):
                 continue
         break
     return values, clear_environment
+
+
+def action_environment_for_replay(environment, launcher_values, *, captured, clear_environment):
+    """Build only the environment the captured action/launcher specifies.
+
+    In particular, do not let runner-only variables leak into the replay of an
+    action that used ``env -i`` or whose environment was not captured.
+    """
+    if clear_environment:
+        result = {}
+    elif captured:
+        result = dict(environment or {})
+    else:
+        result = {}
+    for key, value in launcher_values.items():
+        if value == "<UNSET>":
+            result.pop(key, None)
+        else:
+            result[key] = value
+    return result
 
 
 def looks_like_wrapper(path):
@@ -236,6 +462,43 @@ def log_command(stream, label, args, *, cwd=None, env=None):
     result = run(args, cwd=cwd, env=env)
     print(f"$ {' '.join(map(str, args))}\n{result.stdout.rstrip()}\n(exit={result.returncode})", file=stream)
     return result
+
+
+def trace_linker_execution(launcher, argv, env, cwd, private_dir, target_name, *, environment_captured):
+    """Trace a replay of the captured CppLink argv with only -o redirected."""
+    if not environment_captured:
+        return {"selected": None, "reason": "Bazel JSONPROTO did not expose the CppLink action environment",
+                "trace_path": None, "action_exit": None, "output_redirect_status": "NOT ATTEMPTED"}
+    tracer = shutil.which("strace")
+    if not tracer:
+        return {"selected": None, "reason": "strace is unavailable on the runner",
+                "trace_path": None, "action_exit": None, "output_redirect_status": "NOT ATTEMPTED"}
+    private_dir = Path(private_dir)
+    private_dir.mkdir(parents=True, exist_ok=True)
+    probe_dir = Path(tempfile.mkdtemp(prefix=f"{target_name}-link-probe-", dir=private_dir))
+    trace_path = private_dir / f"{target_name}-linker-execve.private.log"
+    output_path = probe_dir / f"linker-probe-output-{target_name}"
+    probe_argv, output_status = redirect_link_output(argv, output_path)
+    if probe_argv is None:
+        return {"selected": None, "reason": output_status, "trace_path": None,
+                "action_exit": None, "output_redirect_status": output_status}
+    trace_cmd = [tracer, "-f", "-qq", "-e", "trace=execve", "-s", "4096",
+                 "-o", str(trace_path), "--", str(launcher), *probe_argv[1:]]
+    try:
+        result = run(trace_cmd, cwd=cwd, env=env)
+    except OSError as exc:
+        return {"selected": None, "reason": f"strace invocation failed ({type(exc).__name__})",
+                "trace_path": str(trace_path), "action_exit": None,
+                "output_redirect_status": output_status}
+    try:
+        trace_text = trace_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"selected": None, "reason": f"private execve trace could not be read ({type(exc).__name__})",
+                "trace_path": str(trace_path), "action_exit": result.returncode,
+                "output_redirect_status": output_status}
+    selection = resolve_linker_from_execve_trace(trace_text, cwd)
+    return {**selection, "trace_path": str(trace_path), "action_exit": result.returncode,
+            "output_redirect_status": output_status}
 
 
 def discover_actual_compiler(launcher, argv, env, cwd, tf_root, output_base, execution_root, toolchain_paths):
@@ -481,14 +744,24 @@ def main(argv):
         actions, graph_errors, _ = parse_action_graph(actions_file.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_text(f"Bazel JSONPROTO toolchain diagnostic\njson_status=NOT RESOLVED ({type(exc).__name__})\n", encoding="utf-8")
+        report.write_text(
+            f"Bazel JSONPROTO toolchain diagnostic\njson_status=NOT RESOLVED ({type(exc).__name__})\n"
+            f"collector_failure_category[jsonproto-parse]={type(exc).__name__}\ncollector_exit_code=1\n",
+            encoding="utf-8")
         print(f"JSONPROTO could not be parsed or validated ({type(exc).__name__}); private report has details", file=sys.stderr)
         return 1
     execution_root = output_base / "execroot" / "org_tensorflow"
     repo_specs = (("generated_repository", "local_config_embedded_arm"),
                   ("external_repository", "aarch64_linux_toolchain"))
     toolchain_paths = []
+    toolchain_roots = {}
     return_code = 0
+    failure_categories = []
+    default_sysroot_cache = {}
+
+    def mark_failure(category, detail):
+        failure_categories.append(f"{category}: {detail}")
+
     with report.open("w", encoding="utf-8") as stream:
         print("Bazel C++ toolchain diagnostic", file=stream)
         print(f"actions_file={actions_file.resolve()}", file=stream)
@@ -508,15 +781,18 @@ def main(argv):
                 print(f"  candidate={path} -> {path.resolve(strict=False)}; exists={path.exists()}", file=stream)
             if resolved:
                 toolchain_paths.append(resolved)
+                toolchain_roots[repo_name] = resolved
             else:
                 print(f"ERROR: external repository {repo_name} not resolved", file=stream)
                 print(f"toolchain_repository_status[{repo_kind}:{repo_name}]=NOT RESOLVED: repository path not found", file=stream)
+                mark_failure("toolchain-repository", f"{repo_kind}:{repo_name} not resolved")
                 return_code = 1
             if resolved:
                 print(f"toolchain_repository_status[{repo_kind}:{repo_name}]=RESOLVED: repository path found", file=stream)
 
         for error in graph_errors:
             print(f"json_action_graph_error={error}", file=stream)
+            mark_failure("jsonproto-structure", error)
             return_code = 1
         root_links, compile_groups = select_actions(actions, target_name)
         compile_total = len(actions["CppCompile"])
@@ -539,6 +815,7 @@ def main(argv):
             consistency = "NOT RESOLVED: no compile configuration matches the root-link configuration"
         print(f"compile_configuration_consistency={consistency}", file=stream)
         if not config_overlap:
+            mark_failure("configuration-consistency", "no compile configuration matches root CppLink")
             return_code = 1
         selected = {
             "CppCompile": [item for _, item, _ in compile_groups],
@@ -548,9 +825,11 @@ def main(argv):
             print(f"compile_signature_group_configuration={signature[0]} count={member_count} launcher_token={action['argv'][0]}", file=stream)
         if compile_total == 0:
             print("ERROR: no CppCompile actions found for target dependency closure", file=stream)
+            mark_failure("action-selection", "no CppCompile actions in dependency closure")
             return_code = 1
         if len(root_links) != 1:
             print(f"ERROR: expected exactly one CppLink for root label {ROOT_LINK_LABELS[target_name]}; found {len(root_links)}", file=stream)
+            mark_failure("action-selection", f"expected one root CppLink, found {len(root_links)}")
             return_code = 1
         drivers = {}
         for mnemonic in ("CppCompile", "CppLink"):
@@ -559,6 +838,7 @@ def main(argv):
             if not action_list:
                 print(f"ERROR: no selected {mnemonic} actions found in Bazel JSONPROTO", file=stream)
                 print(f"diagnostic_status=NOT RESOLVED: no {mnemonic} action records in aquery output", file=stream)
+                mark_failure("action-selection", f"no selected {mnemonic} action")
                 return_code = 1
             for number, action in enumerate(action_list, start=1):
                 # Raw argv remains private in this report. Public sanitization
@@ -581,13 +861,13 @@ def main(argv):
                     for key in relevant_keys:
                         if key in environment:
                             print(f"  action_env[{key}]={environment[key]}", file=stream)
-                child_env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "HOME") if key in os.environ}
-                child_env.update({key: value for key, value in environment.items() if key in RELEVANT_ENVIRONMENT})
+                child_env = {}
                 expanded_argv = action["argv"]
                 unresolved_response_files = action["argv_unresolved"]
                 if unresolved_response_files:
                     print("  response_file_status=NOT RESOLVED: one or more referenced response files could not be read", file=stream)
                     print(f"  response_files_unresolved_count={len(unresolved_response_files)}", file=stream)
+                    mark_failure("response-files", f"{mnemonic} action #{number} has unresolved param-file references")
                     return_code = 1
                 else:
                     print(f"  response_file_status={action['param_file_status']}", file=stream)
@@ -595,10 +875,13 @@ def main(argv):
                 print(f"  explicit_action_sysroot_arguments={sysroots if sysroots else '<none specified>'}", file=stream)
                 print(f"  explicit_action_sysroot_provenance={'JSONPROTO arguments/paramFiles' if sysroots else '<no explicit value>'}", file=stream)
                 print(f"  action_sysroot_status={'explicit action argument(s)' if sysroots else 'no explicit --sysroot/-isysroot argument'}", file=stream)
+                if not sysroots:
+                    print("  explicit_action_sysroot_value=<none specified>", file=stream)
                 driver = action_driver(action, tf_root, output_base, execution_root, toolchain_paths)
                 if driver is None:
                     print(f"  action_compiler_driver=UNRESOLVED ({action['argv'][0] if action['argv'] else '<empty argv>'})", file=stream)
                     print("  compiler_resolution_status=NOT RESOLVED: action command has no executable token", file=stream)
+                    mark_failure("compiler-resolution", f"{mnemonic} action #{number} has no executable token")
                     return_code = 1
                     continue
                 token, launcher, full_argv = driver
@@ -609,6 +892,8 @@ def main(argv):
                     print("  effective_sysroot_status=NOT RESOLVED: compiler executable is unknown", file=stream)
                     if mnemonic == "CppLink":
                         print("  linker_resolution_status=NOT RESOLVED: CppLink compiler driver is unknown", file=stream)
+                        mark_failure("linker-resolution", f"{mnemonic} action #{number} compiler driver unresolved")
+                    mark_failure("compiler-resolution", f"{mnemonic} action #{number} launcher unresolved")
                     return_code = 1
                     continue
                 cli_environment, clears_environment = launcher_environment(expanded_argv, launcher)
@@ -627,6 +912,14 @@ def main(argv):
                             effective_environment.pop(key, None)
                         else:
                             effective_environment[key] = value
+                # Replay and compiler dry-runs use exactly the captured action
+                # environment after leading env(1) assignments/unsets. No
+                # ambient GitHub runner variables are inherited.
+                child_env = action_environment_for_replay(
+                    environment, cli_environment,
+                    captured=action.get("env_captured", False),
+                    clear_environment=clears_environment,
+                )
                 env_sysroot_values = env_sysroots(effective_environment)
                 print(f"  wrapper_or_environment_sysroot={env_sysroot_values if env_sysroot_values else '<no sysroot hints in captured action/launcher variables>'}", file=stream)
                 environment_is_captured = action.get("env_captured", False) or clears_environment
@@ -649,6 +942,7 @@ def main(argv):
                 if actual_compiler is None:
                     print("  actual_compiler=NOT RESOLVED", file=stream)
                     print("  compiler_resolution_status=NOT RESOLVED: wrapper dry-run did not prove one executable", file=stream)
+                    mark_failure("compiler-resolution", f"{mnemonic} action #{number} wrapper did not prove a compiler")
                     return_code = 1
                 else:
                     print(f"  actual_compiler={actual_compiler}", file=stream)
@@ -657,47 +951,72 @@ def main(argv):
                         actual_compiler, action, effective_environment, environment_is_captured
                     )
 
-                # Effective sysroot is a separate conclusion from the compiler's
-                # configured default. Do not apply that default when wrapper or
-                # action-environment evidence is incomplete.
+                # Probe the compiler default once per actual compiler. This is
+                # deliberately separate from the effective Cpp action value.
+                default_sysroot = None
+                default_sysroot_result = None
+                if actual_compiler is not None:
+                    compiler_key = str(actual_compiler)
+                    if compiler_key not in default_sysroot_cache:
+                        default_env = {key: child_env[key] for key in ("PATH", "LANG", "LC_ALL", "HOME")
+                                       if key in child_env}
+                        result = run([compiler_key, "-print-sysroot"], cwd=execution_root, env=default_env)
+                        default_sysroot_cache[compiler_key] = (result.stdout.strip() if result.returncode == 0 else None,
+                                                               result.returncode)
+                    default_sysroot, default_rc = default_sysroot_cache[compiler_key]
+                    default_sysroot_result = default_rc
+                    identity, normalization = normalize_sysroot_identity(
+                        default_sysroot,
+                        {"aarch64_linux_toolchain": toolchain_roots["aarch64_linux_toolchain"]}
+                        if "aarch64_linux_toolchain" in toolchain_roots else {},
+                        base=execution_root)
+                    print(f"  compiler_default_configured_sysroot={default_sysroot if default_sysroot is not None else '<probe failed>'}", file=stream)
+                    print(f"  compiler_default_sysroot_identity={identity}", file=stream)
+                    print(f"  compiler_default_sysroot_normalization_status={normalization}", file=stream)
+                    print("  compiler_default_sysroot_provenance=actual compiler -print-sysroot with sysroot/compiler-selection environment overrides cleared", file=stream)
+                    if default_rc:
+                        print("  compiler_default_sysroot_status=NOT RESOLVED: -print-sysroot probe failed", file=stream)
+                        mark_failure("default-sysroot-probe", f"{mnemonic} action #{number} compiler -print-sysroot exit={default_rc}")
+                        return_code = 1
+                    else:
+                        print("  compiler_default_sysroot_status=RESOLVED: compiler-reported default/configured value only", file=stream)
+
+                # Resolve effective action sysroot only when action, response
+                # files, captured environment, launcher and compiler probe agree.
                 wrapper_sysroots = []
                 if wrapper_dry_run:
                     wrapper_sysroots = extract_sysroots_text(wrapper_dry_run.stdout)
-                if is_wrapper:
-                    print(f"  wrapper_dry_run_sysroot_arguments={wrapper_sysroots if wrapper_sysroots else '<none exposed>'}", file=stream)
-                    if wrapper_sysroots:
-                        effective = f"wrapper dry-run reported {wrapper_sysroots}"
-                    elif env_sysroot_values:
-                        effective = f"UNRESOLVED: wrapper/environment-provided sysroot hints {env_sysroot_values} were not confirmed in wrapper dry-run"
-                    elif launcher.name == "env" and environment_is_captured and not env_sysroot_values:
-                        effective = "compiler default/configured sysroot applies under captured transparent env launcher"
-                    else:
-                        effective = "UNRESOLVED: wrapper/environment may inject a sysroot not visible in the dry-run"
-                elif sysroots:
-                    effective = f"explicit action sysroot {sysroots}"
-                elif env_sysroot_values:
-                    effective = f"UNRESOLVED: action environment contains sysroot hints {env_sysroot_values}"
-                elif not action.get("env_captured"):
-                    effective = "UNRESOLVED: Bazel action environment was not exposed"
-                elif environment and any(environment.get(key) for key in ("GCC_EXEC_PREFIX", "COMPILER_PATH")):
-                    effective = "UNRESOLVED: compiler search environment may redirect sysroot/tool selection"
-                else:
-                    effective = "compiler default/configured sysroot applies (no wrapper or sysroot override exposed)"
-                print(f"  effective_sysroot_assessment={effective}", file=stream)
-                if sysroots:
-                    sysroot_provenance = "JSONPROTO action arguments or matched paramFiles record"
-                elif env_sysroot_values:
-                    sysroot_provenance = "JSONPROTO action environment and/or env launcher assignments"
-                elif is_wrapper and wrapper_sysroots:
-                    sysroot_provenance = "compiler wrapper action dry-run (-###)"
-                else:
-                    sysroot_provenance = "compiler default/configuration probe; effective only under the stated no-override conditions"
+                print(f"  wrapper_dry_run_sysroot_arguments={wrapper_sysroots if wrapper_sysroots else '<none exposed>'}", file=stream)
+                wrapper_paths = []
+                for value in wrapper_sysroots:
+                    if "=" in value:
+                        wrapper_paths.append(value.split("=", 1)[1])
+                    elif " " in value:
+                        wrapper_paths.append(value.split(" ", 1)[1])
+                effective_value, effective_status, sysroot_provenance = decide_effective_sysroot(
+                    extract_sysroot_paths(expanded_argv),
+                    env_sysroot_values,
+                    environment_is_captured,
+                    (not is_wrapper or launcher.name == "env"),
+                    wrapper_paths,
+                    default_sysroot if default_sysroot_result == 0 else None,
+                    unknown_environment_keys=sorted(
+                        set(effective_environment)
+                        - (RELEVANT_ENVIRONMENT | {"LANG", "LC_ALL", "HOME", "TMPDIR", "TMP", "TEMP", "PWD", "LD_LIBRARY_PATH", "LD_PRELOAD", "SOURCE_DATE_EPOCH"})
+                    ),
+                )
+                effective_identity, effective_normalization = normalize_sysroot_identity(
+                    effective_value,
+                    {"aarch64_linux_toolchain": toolchain_roots["aarch64_linux_toolchain"]}
+                    if "aarch64_linux_toolchain" in toolchain_roots else {},
+                    base=execution_root)
+                print(f"  effective_sysroot_assessment={effective_status}: {sysroot_provenance}", file=stream)
+                print(f"  effective_sysroot_identity={effective_identity}", file=stream)
+                print(f"  effective_sysroot_normalization_status={effective_normalization}", file=stream)
                 print(f"  effective_sysroot_provenance={sysroot_provenance}", file=stream)
-                if effective.startswith("UNRESOLVED"):
-                    print(f"  effective_sysroot_status=NOT RESOLVED: {effective}", file=stream)
-                else:
-                    print("  effective_sysroot_status=RESOLVED from action/wrapper/environment evidence", file=stream)
-                if effective.startswith("UNRESOLVED"):
+                print(f"  effective_sysroot_status={effective_status}: {sysroot_provenance}", file=stream)
+                if effective_status != "RESOLVED":
+                    mark_failure("effective-sysroot", f"{mnemonic} action #{number}: {sysroot_provenance}")
                     return_code = 1
 
                 if mnemonic == "CppLink":
@@ -720,6 +1039,7 @@ def main(argv):
                     print(f"  CppLink_action_specific_print_prog_name_token={action_linker_token or '<empty>'}", file=stream)
                     print(f"  CppLink_linker_candidate_path={action_linker_path or '<UNRESOLVED>'}", file=stream)
                     if action_linker_probe.returncode:
+                        mark_failure("linker-candidate-probe", f"CppLink action #{number} -print-prog-name=ld exit={action_linker_probe.returncode}")
                         return_code = 1
                     if action_linker_path:
                         candidate_version = run([str(action_linker_path), "--version"])
@@ -727,6 +1047,7 @@ def main(argv):
                         print(candidate_version.stdout.rstrip(), file=stream)
                         print(f"  CppLink_linker_candidate_version_exit={candidate_version.returncode}", file=stream)
                         if candidate_version.returncode:
+                            mark_failure("linker-candidate-version", f"CppLink action #{number} candidate --version exit={candidate_version.returncode}")
                             return_code = 1
                     else:
                         print("  CppLink_linker_candidate_version=UNRESOLVED", file=stream)
@@ -736,42 +1057,69 @@ def main(argv):
                         lambda item: resolve_executable(item, tf_root, output_base, execution_root, toolchain_paths),
                         dry_run_succeeded=(dry_run.returncode == 0),
                     )
-                    linker_lines = selection["lines"]
                     if selection["helpers"]:
                         print("  linker_driver_helper=collect2 (not the actual linker)", file=stream)
                         for line in selection["helpers"]:
                             print(f"    {line}", file=stream)
-
-                    if linker_lines:
-                        print("  selected_linker_command_lines:", file=stream)
-                        for line in linker_lines:
-                            print(f"    {line}", file=stream)
-                        if selection["selected"]:
-                            selected_linker = selection["selected"]
-                            print(f"  actual_selected_linker={selected_linker}", file=stream)
-                            print("  linker_evidence=direct linker executable in captured CppLink -### output", file=stream)
-                            linker_version = run([str(selected_linker), "--version"])
-                            print(linker_version.stdout.rstrip(), file=stream)
-                            print(f"  actual_linker_version_exit={linker_version.returncode}", file=stream)
-                            if linker_version.returncode:
-                                return_code = 1
-                        else:
-                            print(f"  actual_selected_linker=UNRESOLVED; {selection['reason']}; tokens={selection['tokens']}; unresolved={selection['unresolved']}", file=stream)
-                            print(f"  linker_resolution_status=NOT RESOLVED: {selection['reason']}", file=stream)
+                    # -### is useful evidence about the driver's plan, but it
+                    # does not execute the linker. Only the successful execve
+                    # trace of this action-compatible replay resolves actual.
+                    print(f"  dry_run_linker_selection_candidate={selection['selected'] or '<not proven by -###>'}", file=stream)
+                    trace_result = trace_linker_execution(
+                        launcher, expanded_argv, child_env, execution_root,
+                        report.parent / "linker-exec-traces", f"{target_name}-{number}",
+                        environment_captured=environment_is_captured)
+                    print(f"  linker_trace_status={'RESOLVED' if trace_result['selected'] else 'NOT RESOLVED'}", file=stream)
+                    print(f"  linker_trace_action_exit={trace_result.get('action_exit')}", file=stream)
+                    print(f"  linker_trace_output_redirect_status={trace_result['output_redirect_status']}", file=stream)
+                    if trace_result.get("trace_path"):
+                        print(f"  linker_trace_private_file={trace_result['trace_path']}", file=stream)
+                    if trace_result.get("helpers"):
+                        print("  linker_trace_driver_helper=collect2 (not the actual linker)", file=stream)
+                    selected_linker = trace_result["selected"]
+                    linker_evidence = "successful linker execve observed by strace while replaying captured CppLink argv with recognized outputs redirected to private paths"
+                    if selected_linker:
+                        print(f"  actual_linker_observed_execve={trace_result['observed']}", file=stream)
+                        print(f"  linker_trace_reason={trace_result['reason']}", file=stream)
+                        if selection["selected"] and selection["selected"] != selected_linker:
+                            print("  linker_dry_run_vs_trace=DIFFERENT: actual resolution uses the executed trace", file=stream)
+                        if trace_result.get("action_exit") != 0:
+                            mark_failure("linker-trace-execution", f"{mnemonic} action #{number} replay exited {trace_result.get('action_exit')}")
                             return_code = 1
                     else:
-                        print("  actual_selected_linker=UNRESOLVED; action-specific -print-prog-name=ld is only a candidate, and -### did not prove the selected linker", file=stream)
-                        print("  linker_resolution_status=NOT RESOLVED: action dry-run did not prove a unique invoked linker", file=stream)
+                        trace_reason = trace_result["reason"]
+                        print(f"  actual_selected_linker=UNRESOLVED; dry-run: {selection['reason']}; trace: {trace_reason}", file=stream)
+                        print(f"  linker_resolution_status=NOT RESOLVED: {trace_reason}", file=stream)
+                        mark_failure("linker-resolution", f"{mnemonic} action #{number}: {trace_reason}")
                         return_code = 1
-                    if selection["selected"]:
-                        print("  linker_resolution_status=RESOLVED: unique direct linker invocation in action dry-run", file=stream)
+                    if selected_linker:
+                        print(f"  actual_selected_linker={selected_linker}", file=stream)
+                        print(f"  linker_evidence={linker_evidence}", file=stream)
+                        linker_version = run([str(selected_linker), "--version"])
+                        linker_target = run([str(selected_linker), "-V"])
+                        implementation = linker_implementation(linker_version.stdout, selected_linker)
+                        target_architecture = linker_target_architecture(linker_target.stdout)
+                        first_version_line = next((line.strip() for line in linker_version.stdout.splitlines() if line.strip()), "<empty>")
+                        print(f"  actual_linker_basename={Path(selected_linker).name}", file=stream)
+                        print(f"  actual_linker_implementation={implementation}", file=stream)
+                        print(f"  actual_linker_version={first_version_line}", file=stream)
+                        print(f"  actual_linker_target_architecture={target_architecture}", file=stream)
+                        identity_status = "RESOLVED" if linker_version.returncode == 0 and implementation != "UNRESOLVED" else "NOT RESOLVED"
+                        print(f"  actual_linker_identity_status={identity_status}", file=stream)
+                        print(f"  actual_linker_version_exit={linker_version.returncode}", file=stream)
+                        print(f"  actual_linker_target_probe_exit={linker_target.returncode}", file=stream)
+                        if identity_status != "RESOLVED":
+                            mark_failure("linker-identity", f"{mnemonic} action #{number}: linker version/implementation unresolved")
+                            return_code = 1
+                        print("  linker_resolution_status=RESOLVED: actual linker executable evidence recorded", file=stream)
                     if dry_run.returncode:
-                        print("  WARNING: CppLink dry-run returned nonzero; linker selection is incomplete", file=stream)
+                        print("  WARNING: CppLink dry-run returned nonzero; direct dry-run evidence is unavailable", file=stream)
+                        mark_failure("linker-dry-run", f"{mnemonic} action #{number} -### exit={dry_run.returncode}")
                         return_code = 1
-
         print("\n=== Actual compiler metadata (wrapper paths excluded) ===", file=stream)
         if not drivers:
             print("ERROR: no actual compiler executable was proven from Bazel C++ actions", file=stream)
+            mark_failure("compiler-resolution", "no compiler executable proved from any selected action")
             return_code = 1
         for (mnemonic, _, _), (compiler, action, environment, env_captured) in sorted(drivers.items()):
             print(f"\n--- actual compiler used by {mnemonic}: {compiler} ---", file=stream)
@@ -785,30 +1133,38 @@ def main(argv):
             ):
                 if log_command(stream, label, args, env=probe_env).returncode:
                     print(f"compiler_metadata_status=NOT RESOLVED: {label} probe failed", file=stream)
+                    mark_failure("compiler-metadata", f"{mnemonic} {label} probe failed")
                     return_code = 1
-            default_env = probe_env.copy()
-            for key in ("SYSROOT", "SDKROOT", "GCC_EXEC_PREFIX", "COMPILER_PATH",
-                        "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"):
-                default_env.pop(key, None)
-            default_sysroot = log_command(
-                stream, "compiler default/configured sysroot (sysroot-injecting environment cleared; not the action-effective value)",
-                [str(compiler), "-print-sysroot"], env=default_env
-            )
-            print(f"compiler_default_configured_sysroot={default_sysroot.stdout.strip() or '<empty>'}", file=stream)
-            if default_sysroot.returncode:
-                print("compiler_default_sysroot_status=NOT RESOLVED: -print-sysroot probe failed", file=stream)
+            default_value, default_exit = default_sysroot_cache.get(str(compiler), (None, None))
+            default_identity, default_normalization = normalize_sysroot_identity(
+                default_value, {"aarch64_linux_toolchain": toolchain_roots["aarch64_linux_toolchain"]}
+                if "aarch64_linux_toolchain" in toolchain_roots else {},
+                base=execution_root)
+            print(f"compiler_default_configured_sysroot={default_value if default_value is not None else '<probe failed>'}", file=stream)
+            print(f"compiler_default_sysroot_identity={default_identity}", file=stream)
+            print(f"compiler_default_sysroot_normalization_status={default_normalization}", file=stream)
+            print("compiler_default_sysroot_provenance=actual compiler -print-sysroot with sysroot/compiler-selection environment overrides cleared", file=stream)
+            if default_exit is None or default_exit:
+                print("compiler_default_sysroot_status=NOT RESOLVED: -print-sysroot probe failed or was not collected", file=stream)
+                mark_failure("default-sysroot-probe", f"{mnemonic} default sysroot probe unavailable/exit={default_exit}")
                 return_code = 1
             else:
                 print("compiler_default_sysroot_status=RESOLVED: compiler-reported default/configured value only", file=stream)
             if log_command(stream, "compiler search directories", [str(compiler), "-print-search-dirs"], env=probe_env).returncode:
                 print("compiler_search_directories_status=NOT RESOLVED: probe failed", file=stream)
+                mark_failure("compiler-metadata", f"{mnemonic} -print-search-dirs probe failed")
                 return_code = 1
             reported_linker = log_command(stream, "compiler-reported default linker (informational only; not proof of CppLink selection)",
                                           [str(compiler), "-print-prog-name=ld"], env=probe_env)
             print(f"compiler_reported_default_linker={reported_linker.stdout.strip() or '<empty>'}", file=stream)
             if reported_linker.returncode:
                 print("compiler_default_linker_status=NOT RESOLVED: informational probe failed", file=stream)
+                mark_failure("compiler-metadata", f"{mnemonic} -print-prog-name=ld probe failed")
                 return_code = 1
+        return_code = diagnostic_exit_code(return_code, failure_categories)
+        for category in failure_categories:
+            print(f"collector_failure_category={category}", file=stream)
+        print(f"collector_exit_code={return_code}", file=stream)
         stream.flush()
     return return_code
 
@@ -823,6 +1179,8 @@ if __name__ == "__main__":
             try:
                 with open(sys.argv[4], "a", encoding="utf-8") as report_stream:
                     print(f"FATAL_DIAGNOSTIC_ERROR={type(exc).__name__}", file=report_stream)
+                    print(f"collector_failure_category=fatal-exception: {type(exc).__name__}", file=report_stream)
+                    print("collector_exit_code=1", file=report_stream)
                     traceback.print_exc(file=report_stream)
             except OSError:
                 pass

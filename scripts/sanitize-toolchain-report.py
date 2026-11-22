@@ -48,7 +48,13 @@ def sanitize(source, destination):
         "actual_compiler=", "explicit_action_sysroot_arguments=",
         "effective_sysroot_assessment=", "compiler_default_configured_sysroot=",
         "effective_sysroot_provenance=",
-        "wrapper_or_environment_sysroot=", "actual_selected_linker=",
+        "effective_sysroot_identity=", "effective_sysroot_normalization_status=",
+        "compiler_default_sysroot_identity=", "compiler_default_sysroot_normalization_status=",
+        "compiler_default_sysroot_provenance=", "compiler_default_sysroot_status=",
+        "wrapper_or_environment_sysroot=", "actual_selected_linker=", "actual_linker_basename=",
+        "actual_linker_implementation=", "actual_linker_version=", "actual_linker_target_architecture=",
+        "actual_linker_identity_status=",
+        "linker_trace_status=", "linker_trace_action_exit=", "linker_trace_output_redirect_status=",
         "CppLink_linker_candidate_path=", "linker_evidence=", "linker_driver_helper=",
         "compiler_resolution_status=", "effective_sysroot_status=", "linker_resolution_status=",
         "action_environment_status=", "action_sysroot_status=", "wrapper_dry_run_sysroot_arguments=",
@@ -103,7 +109,7 @@ def sanitize(source, destination):
             normalized = line.strip()
             if normalized.startswith(action_fields):
                 path_field = re.match(
-                    r"(action_launcher_token|resolved_action_launcher|compiler_wrapper|actual_compiler|actual_selected_linker|CppLink_linker_candidate_path)=(.*)$",
+                    r"(action_launcher_token|resolved_action_launcher|compiler_wrapper|actual_compiler|actual_selected_linker|actual_linker_observed_execve|CppLink_linker_candidate_path)=(.*)$",
                     normalized,
                 )
                 if path_field:
@@ -130,6 +136,13 @@ def sanitize(source, destination):
                 metadata_mode = "actual_linker_version"
                 continue
             if normalized.startswith("linker_evidence="):
+                evidence = normalized.partition("=")[2]
+                approved_evidence = (
+                    "direct linker executable in CppLink compiler-driver -### output",
+                    "successful linker execve observed by strace while replaying captured CppLink argv with recognized outputs redirected to private paths",
+                )
+                if evidence in approved_evidence:
+                    output.append(f"linker_evidence={evidence}")
                 continue
             if metadata_mode in ("linker_candidate_version", "actual_linker_version") and line.strip():
                 label = "linker_candidate_version" if metadata_mode == "linker_candidate_version" else "actual_linker_version"
@@ -147,6 +160,13 @@ def sanitize(source, destination):
             continue
         if line.startswith("compiler_default_configured_sysroot="):
             output.append("compiler_default_configured_sysroot=" + ("<empty>" if line.partition("=")[2].strip() in ("", "<empty>") else "<value omitted>"))
+        elif line.startswith(("compiler_default_sysroot_identity=", "compiler_default_sysroot_normalization_status=",
+                              "compiler_default_sysroot_provenance=", "compiler_default_sysroot_status=")):
+            output.append(redact(line.strip()))
+        elif line.startswith("collector_failure_category="):
+            output.append(redact(line.strip()))
+        elif line.startswith("collector_exit_code="):
+            output.append(line.strip())
         elif line.startswith("compiler_reported_default_linker="):
             value = line.partition("=")[2].strip()
             output.append("compiler_reported_default_linker=" + (Path(value).name if value and value != "<empty>" else "<empty>"))

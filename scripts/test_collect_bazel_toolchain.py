@@ -173,6 +173,21 @@ class IntegrationAndSecurityTests(unittest.TestCase):
     def test_wrapper_dry_run_identifies_compiler(self):
         self.assertEqual(collector.compiler_tokens_from_dry_run('COLLECT_GCC="/opt/cross/bin/aarch64-linux-gnu-gcc"\n'), ["/opt/cross/bin/aarch64-linux-gnu-gcc"])
 
+    def test_action_replay_uses_captured_environment_without_runner_leakage(self):
+        replay = collector.action_environment_for_replay(
+            {"PATH": "/pinned/tool/bin", "LANG": "C", "PRIVATE_TOKEN": "secret"},
+            {"PATH": "/action/bin", "SDKROOT": "/action/sdk"},
+            captured=True, clear_environment=False)
+        self.assertEqual(replay, {"PATH": "/action/bin", "LANG": "C", "PRIVATE_TOKEN": "secret", "SDKROOT": "/action/sdk"})
+        isolated = collector.action_environment_for_replay(
+            {"PATH": "/ignored", "RUNNER_SECRET": "never-inherit"},
+            {"PATH": "/explicit/bin", "REMOVE_ME": "<UNSET>"},
+            captured=False, clear_environment=True)
+        self.assertEqual(isolated, {"PATH": "/explicit/bin"})
+        unknown = collector.action_environment_for_replay(
+            None, {"CUSTOM": "value"}, captured=False, clear_environment=False)
+        self.assertEqual(unknown, {})
+
     def test_actual_linker_requires_direct_dry_run_evidence(self):
         path = "/tool/bin/aarch64-linux-gnu-ld"
         dry_run = 'COLLECT_GCC="/tool/bin/aarch64-linux-gnu-g++"\n/tool/libexec/collect2 -o smoke\n' + path + " -o smoke\n"
@@ -181,6 +196,161 @@ class IntegrationAndSecurityTests(unittest.TestCase):
         self.assertEqual(len(result["helpers"]), 1)
         no_proof = collector.linker_selection_from_dry_run("COLLECT_GCC=compiler\ncollect2 -o smoke\n", path, lambda _: path)
         self.assertIsNone(no_proof["selected"])
+
+    def test_execve_trace_proves_actual_linker_after_collect2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            collect2 = root / "collect2"
+            linker = root / "aarch64-none-linux-gnu-ld"
+            for path in (collect2, linker):
+                path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                path.chmod(0o755)
+            trace = (f'execve("{collect2}", ["collect2"], 0x0, 0) = 0\n'
+                     f'execve("{linker}", ["{linker}"], 0x0, 0) = 0\n')
+            result = collector.resolve_linker_from_execve_trace(trace, root)
+        self.assertEqual(result["selected"], str(linker.resolve()))
+        self.assertEqual(result["helpers"], [str(collect2)])
+
+    def test_collect2_candidate_alone_does_not_prove_linker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            collect2 = root / "collect2"
+            collect2.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            collect2.chmod(0o755)
+            result = collector.resolve_linker_from_execve_trace(
+                f'execve("{collect2}", ["collect2"], 0x0, 0) = 0\n', root)
+        self.assertIsNone(result["selected"])
+        self.assertIn("no recognized linker", result["reason"])
+
+    def test_trace_rejects_ambiguous_and_unrecognized_linker_executables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second, unknown = (root / "aarch64-linux-ld", root / "ld.lld", root / "mystery-link")
+            for path in (first, second, unknown):
+                path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                path.chmod(0o755)
+            ambiguous = (f'execve("{first}", [], 0x0, 0) = 0\n'
+                         f'execve("{second}", [], 0x0, 0) = 0\n')
+            unknown_trace = f'execve("{unknown}", [], 0x0, 0) = 0\n'
+            ambiguous_result = collector.resolve_linker_from_execve_trace(ambiguous, root)
+            unknown_result = collector.resolve_linker_from_execve_trace(unknown_trace, root)
+        self.assertIsNone(ambiguous_result["selected"])
+        self.assertIn("multiple distinct", ambiguous_result["reason"])
+        self.assertIsNone(unknown_result["selected"])
+
+    def test_execve_parser_ignores_failed_exec_attempts(self):
+        trace = 'execve("/missing/ld", [], 0x0, 0) = -1 ENOENT (No such file)\n'
+        self.assertEqual(collector.successful_execve_paths(trace), [])
+
+    def test_link_output_redirect_requires_one_separated_output_operand(self):
+        redirected, reason = collector.redirect_link_output(["g++", "-shared", "-o", "out.so", "a.o"], "/private/probe.so")
+        self.assertEqual(redirected, ["g++", "-shared", "-o", "/private/probe.so", "a.o"])
+        self.assertIn("1 recognized link output(s) redirected", reason)
+        redirected_map, map_reason = collector.redirect_link_output(
+            ["g++", "-o", "out", "-Wl,-Map,original.map", "a.o"], "/private/probe/probe-output")
+        self.assertIn("-Wl,-Map,/private/probe/probe-extra-1.map", redirected_map)
+        self.assertIn("2 recognized link output(s) redirected", map_reason)
+        result, reason = collector.redirect_link_output(["g++", "-o", "a", "-o", "b"], "/private/x")
+        self.assertIsNone(result)
+        self.assertIn("found 2", reason)
+
+    def test_linker_identity_and_aarch64_target_marker(self):
+        self.assertEqual(collector.linker_implementation("GNU ld (GNU Binutils) 2.38", "/x/aarch64-linux-ld"), "GNU ld")
+        self.assertEqual(collector.linker_implementation("LLD 17.0", "/x/ld.lld"), "LLVM LLD")
+        self.assertEqual(collector.linker_implementation("unknown linker", "/x/strange"), "UNRESOLVED")
+        self.assertEqual(collector.linker_target_architecture("Supported emulations: aarch64linux"), "AArch64 supported")
+        self.assertEqual(collector.linker_target_architecture("Supported emulations: elf_x86_64"), "not confirmed by linker -V")
+
+    def test_sysroot_normalizes_inside_toolchain_and_hides_outside_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "toolchain"
+            inside = root / "aarch64-none-linux-gnu" / "libc"
+            outside = Path(directory) / "runner" / "secret-sysroot"
+            inside.mkdir(parents=True)
+            outside.mkdir(parents=True)
+            identity, status = collector.normalize_sysroot_identity(str(inside), {"aarch64_linux_toolchain": root})
+            external_identity, external_status = collector.normalize_sysroot_identity(str(outside), {"aarch64_linux_toolchain": root})
+        self.assertEqual(identity, "aarch64_linux_toolchain/aarch64-none-linux-gnu/libc")
+        self.assertEqual(status, "RELATIVE_TO_PINNED_TOOLCHAIN_ROOT")
+        self.assertEqual(external_identity, "basename:secret-sysroot")
+        self.assertEqual(external_status, "BASENAME_ONLY_OUTSIDE_PINNED_TOOLCHAIN_ROOT")
+        self.assertNotIn(str(root.parent), external_identity)
+
+    def test_empty_default_sysroot_remains_distinct_from_missing(self):
+        empty = collector.normalize_sysroot_identity("", {})
+        missing = collector.normalize_sysroot_identity(None, {})
+        self.assertEqual(empty, ("<empty>", "EMPTY_VALUE"))
+        self.assertEqual(missing, ("<unresolved>", "NOT_RESOLVED"))
+
+    def test_effective_sysroot_provenance_and_explicit_override(self):
+        action = collector.decide_effective_sysroot([], [], True, True, [], "/configured/sysroot")
+        override = collector.decide_effective_sysroot(["/action/sysroot"], [], True, True, [], "/configured/sysroot")
+        self.assertEqual(action, ("/configured/sysroot", "RESOLVED", "compiler default/configuration under captured no-override action environment"))
+        self.assertEqual(override, ("/action/sysroot", "RESOLVED", "JSONPROTO action arguments or matched paramFiles"))
+        self.assertNotEqual(action[2], override[2])
+
+    def test_sysroot_in_response_file_and_environment_overrides_fail_closed(self):
+        actions, errors, _ = collector.validate_action_graph(fixture_graph())
+        self.assertEqual(errors, [])
+        rsp_paths = collector.extract_sysroot_paths(actions["CppCompile"][0]["argv"])
+        self.assertEqual(rsp_paths, ["/synthetic/sysroot"])
+        env_override = collector.decide_effective_sysroot([], ["SYSROOT=<private>"], True, True, [], "/default")
+        unreviewed = collector.decide_effective_sysroot([], [], True, True, [], "/default", ["CUSTOM_COMPILER_MODE"])
+        self.assertEqual(env_override[1], "NOT RESOLVED")
+        self.assertEqual(unreviewed[1], "NOT RESOLVED")
+
+    def test_all_explicit_sysroot_forms_are_preserved_from_effective_argv(self):
+        values = collector.extract_sysroot_paths(
+            ["cc", "--sysroot", "/one", "--sysroot=/two", "-isysroot", "/three", "-isysroot=/four"])
+        self.assertEqual(values, ["/one", "/two", "/three", "/four"])
+
+    def test_wrapper_dry_run_sysroot_is_separate_provenance(self):
+        result = collector.decide_effective_sysroot([], [], True, False, ["/wrapper/sysroot"], "/default")
+        self.assertEqual(result, ("/wrapper/sysroot", "RESOLVED", "wrapper dry-run final compiler arguments (-###)"))
+
+    def test_default_sysroot_empty_is_resolved_but_unset_environment_is_not(self):
+        empty_default = collector.decide_effective_sysroot([], [], True, True, [], "")
+        missing_environment = collector.decide_effective_sysroot([], [], False, True, [], "/default")
+        wrapper_unknown = collector.decide_effective_sysroot([], [], True, False, [], "/default")
+        self.assertEqual(empty_default[0:2], ("", "RESOLVED"))
+        self.assertEqual(missing_environment[1], "NOT RESOLVED")
+        self.assertEqual(wrapper_unknown[1], "NOT RESOLVED")
+
+    def test_unresolved_critical_diagnostics_cannot_return_success(self):
+        self.assertEqual(collector.diagnostic_exit_code(0, []), 0)
+        self.assertEqual(collector.diagnostic_exit_code(0, ["linker-resolution: unresolved"]), 1)
+        self.assertEqual(collector.diagnostic_exit_code(1, []), 1)
+
+    def test_sanitizer_publishes_normalized_sysroot_and_linker_identity_only(self):
+        private = """[CppLink #1]
+  actual_selected_linker=/home/runner/tool/bin/aarch64-none-linux-gnu-ld
+  actual_linker_basename=aarch64-none-linux-gnu-ld
+  actual_linker_implementation=GNU ld
+  actual_linker_version=GNU ld (GNU Binutils) 2.38.20220708
+  actual_linker_target_architecture=AArch64 supported
+  linker_evidence=successful linker execve observed by strace while replaying captured CppLink argv with recognized outputs redirected to private paths
+  linker_resolution_status=RESOLVED: actual linker executable evidence recorded
+  compiler_default_sysroot_identity=aarch64_linux_toolchain/aarch64-none-linux-gnu/libc
+  compiler_default_sysroot_normalization_status=RELATIVE_TO_PINNED_TOOLCHAIN_ROOT
+  compiler_default_sysroot_provenance=actual compiler -print-sysroot with sysroot/compiler-selection environment overrides cleared
+  effective_sysroot_identity=aarch64_linux_toolchain/aarch64-none-linux-gnu/libc
+  effective_sysroot_normalization_status=RELATIVE_TO_PINNED_TOOLCHAIN_ROOT
+  effective_sysroot_provenance=compiler default/configuration under captured no-override action environment
+  action_env[PATH]=/home/runner/private/tool/bin
+  linker_trace_private_file=/home/runner/private/raw-execve.log
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination = Path(directory) / "private.txt", Path(directory) / "public.txt"
+            source.write_text(private, encoding="utf-8")
+            sanitizer.sanitize(source, destination)
+            public = destination.read_text(encoding="utf-8")
+        self.assertIn("actual_linker_basename=aarch64-none-linux-gnu-ld", public)
+        self.assertIn("actual_linker_implementation=GNU ld", public)
+        self.assertIn("actual_linker_version=GNU ld (GNU Binutils) 2.38.20220708", public)
+        self.assertIn("actual_linker_target_architecture=AArch64 supported", public)
+        self.assertIn("effective_sysroot_identity=aarch64_linux_toolchain/aarch64-none-linux-gnu/libc", public)
+        for forbidden in ("/home/runner/", "raw-execve", "action_env[PATH]", "private/tool"):
+            self.assertNotIn(forbidden, public)
 
     def test_production_wrapper_resolution_uses_dry_run_compiler_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
