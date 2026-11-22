@@ -51,6 +51,8 @@ jobs:
           grep -Eq 'execve\("[^"]*/ld[^"]*".*= 0$' work/compiler.trace
       - id: measure
         run: python3 scripts/phase2c.py validation
+      - name: Recover kernel names from byte-matched diagnostic link
+        run: bash scripts/phase2c-attribution.sh > "$RUNNER_TEMP/symbols-log" 2>&1 || { tail -n 1 "$RUNNER_TEMP/symbols-log" | cut -c1-160; exit 1; }
       - if: ${{ !cancelled() && steps.measure.outcome != 'skipped' }}
         run: cd public && sha256sum isa.json > SHA256SUMS
       - id: upload

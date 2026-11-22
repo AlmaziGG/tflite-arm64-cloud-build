@@ -75,9 +75,12 @@ def caps(text):
 def validation():
     special, instructions = inventory()
     q = shutil.which("qemu-aarch64")
-    models = b.p2.output([q,"-cpu","help"]).split()
+    listing=subprocess.run([q,"-cpu","help",work/"probe"],capture_output=True,text=True)
+    listing_text=listing.stdout+listing.stderr
+    assert "cortex-a53" in listing_text.split(), "unrecognized QEMU model list"
+    models=listing_text.split()
     results = dict(version=b.p2.output([q,"--version"]).splitlines()[0], executable=Path(q).name,
-                   model="cortex-a35", available="cortex-a35" in models, binaries=pins,
+                   model="cortex-a35", help_exit=listing.returncode, available="cortex-a35" in models, binaries=pins,
                    counts=dict(collections.Counter((r[2]+":"+r[3]) for r in special.values())),
                    inventory=special, firmware={})
     for n in ("14","15"):
@@ -110,6 +113,7 @@ def validation():
                     if match: pcs.add(int(match[1],16)-bias)
             inside=pcs & instructions.keys()
             assert inside
+            (work/("pcs"+n)).write_text(json.dumps(sorted(inside)))
             row["translated_library_pcs"]=len(inside)
             row["translated_special"]=dict(collections.Counter(special[p][2] for p in inside & special.keys()))
             row["translated_symbols"]=sorted({instructions[p] for p in inside})
