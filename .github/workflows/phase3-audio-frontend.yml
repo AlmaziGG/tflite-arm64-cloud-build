@@ -44,6 +44,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends qemu-user
       - name: Audit both OTAs then compare emulated inference
         run: python3 scripts/phase3.py
+      - name: Exercise verification against tampered copies of measured evidence
+        run: python3 scripts/test_phase3.py ArtifactTests
       - id: upload
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:

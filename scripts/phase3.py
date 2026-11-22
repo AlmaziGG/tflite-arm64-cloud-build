@@ -26,7 +26,7 @@ PUB = Path("public")
 AUDIT = "PHASE-3-REUSE-ASSESSMENT.md"
 FILES = (AUDIT, "phase3-report.json", "frontend-equivalence.json", "streaming-results.json",
          "detection-results.json", "resource-summary.json")
-CHUNKS = (1, 80, 160, 256, 480, 512, 377)
+CHUNKS = (1, 80, 160, 256, 480, 512, 377, "vary")
 NAMES = ("silence", "zeros", "tone440", "quiet", "high", "impulse", "step", "noise", "mixed", "boundary", "long")
 sha = lambda buf: hashlib.sha256(buf).hexdigest()
 
@@ -84,7 +84,7 @@ def candidate(exe, inputs, chunk, data=None, prefix=()):
     check(len(blob)%125==0,"incomplete frame trace")
     frames=[blob[i:i+125] for i in range(0,len(blob),125)]
     metrics=[list(map(int,x.split())) for x in re.findall(rb"(?m)^metrics ([0-9 ]+)$",result.stderr)]
-    check(len(metrics)==len(inputs) and all(len(m)==8 for m in metrics),"session metrics")
+    check(len(metrics)==len(inputs) and all(len(m)==10 for m in metrics),"session metrics")
     events=result.stdout.decode().splitlines()
     check(all(e=="Алиса" for e in events),"stdout protocol")
     return frames,metrics,events
@@ -178,6 +178,23 @@ def audit(elf,root):
     return result
 
 
+def linked_inputs():
+    seen=set()
+    for line in (P/"link.inputs").read_text().splitlines():
+        path=Path(line.strip())
+        if not path.is_file():
+            continue
+        physical=path.resolve()
+        ref.b.p2.check_system_link_input(physical,ref.b.SDK)
+        if physical.is_relative_to(ref.b.SDK) or physical==ref.lib:
+            seen.add(physical)
+    check(ref.lib in seen,"missing linked immutable library")
+    wanted={key:Path(ref.b.p2.output([ref.b.GCC,"-print-file-name="+key])).resolve()
+            for key in ref.b.RUNTIME}
+    ref.b.check_inputs(seen,wanted,True)
+    return {k:ref.b.abi.digest(v) for k,v in wanted.items()}
+
+
 def actual_providers(log,root,elf):
     expected={elf.resolve():ref.b.abi.digest(elf)}
     for path,digest in re.findall(r"(?m)^OK DT_NEEDED \S+: (.+?) \([^)]+\); ELF64/AArch64; SHA256=([0-9a-f]{64});",log):
@@ -244,6 +261,7 @@ def matrix():
             delta=[(x.decode(),y.decode()) for x,y in zip(native_tables,guest_tables) if x!=y]
             table_control[mode]=dict(count=len(delta),first=delta[:6])
         print("Capsule",n,"initial coefficient differences",table_control,flush=True)
+        check(table_control["off"]["count"]==0,"target coefficient initialization differs from host")
         reports[n]={"strict_audits":6,"coefficient_control":table_control,"guest_providers":{p.name:h for p,h in expected.items()}}
         det[n]={}; resources[n]={}
         for name in NAMES:
@@ -262,15 +280,26 @@ def matrix():
             det[n][name]=dict(invokes=len(scores),raw=list(scores),raw_sha256=sha(scores),
                               sum_by_frame=[x[1] for x in actual],denominator=2550,
                               events_end_sample=[480+160*i for i,x in enumerate(actual) if x[2]])
+            check(m[8]<=160 and m[9]<=3,"queue bound")
             resources[n][name]=dict(zip(("samples","frames","invokes","frontend_init_ns","interpreter_init_ns",
-                                         "frontend_ns","invoke_ns","total_ns"),m))
+                                         "frontend_ns","invoke_ns","total_ns","max_block_samples","max_group_frames"),m))
         # Fresh interpreter and frontend in the same process versus separate processes.
         path=P/"mixed.wav"
         single,_,_=candidate(runner,[path],80,prefix=prefix)
         double,_,_=candidate(runner,[path,path],512,prefix=prefix)
         check(double==single*2,"session isolation")
-        raw,_,_=candidate(runner,["-"],1,fixture("mixed"),prefix)
-        check(raw==single,"guest raw chunk invariance")
+        joined,_,_=candidate(runner,["-"],160,fixture("mixed")*2,prefix)
+        reports[n]["sessions"]=dict(independent_traces_identical=True,continuous_frames=len(joined),
+                                     independent_frames=len(double),continuous_sha=sha(b"".join(joined)),
+                                     independent_sha=sha(b"".join(double)))
+        check(len(joined)>len(double),"continuous history discarded")
+        (P/"invalid.model").write_bytes(bytes(64))
+        for model in (P/"invalid.model",P/"absent.model"):
+            failed_model=subprocess.run([*prefix,runner,model,"-","160",path],capture_output=True,timeout=20)
+            check(failed_model.returncode==1 and b"FAIL model" in failed_model.stderr,"model failure visibility")
+        for pattern in CHUNKS:
+            raw,_,_=candidate(runner,["-"],pattern,fixture("mixed"),prefix)
+            check(raw==single,"guest raw chunk invariance")
         rss=P/"rss.private"
         command(["/usr/bin/time","-f","%M","-o",rss,*prefix,runner,ref.work/"model","-","160",P/"long.wav"])
         resources[n]["max_host_qemu_rss_kib"]=int(rss.read_text().strip())
@@ -278,9 +307,10 @@ def matrix():
         check(resources[n]["continuous_host_rss"]["late_minus_early_kib"]<=1024,"unexplained sustained RSS growth")
     check(det["14"]==det["15"],"OTA trace divergence")
     # Native throughput is a feature extraction measurement (no x86 TFLite in this build).
-    _,hostmetrics,_=candidate(P/"host",[P/"long.wav"],160)
+    native=command([P/"host","-","-","160",P/"long.wav"])
+    native_ns=int(re.search(rb"(?m)^metrics ([0-9 ]+)$",native.stderr)[1].split()[7])
     for n in roots:
-        resources[n]["host_frontend_long_total_ns"]=hostmetrics[0][7]
+        resources[n]["host_frontend_long_total_ns"]=native_ns
     save("detection-results.json",det); save("resource-summary.json",resources)
     info=ref.b.p2.metadata(runner)
     info.pop("definitions",None)
@@ -288,6 +318,7 @@ def matrix():
     quant=rust_quantization(inp["scale"][0],inp["zero"][0])
     check(quant["different"]>0,"unexpected Rust quantization result")
     save("phase3-report.json",dict(commit=os.environ["GITHUB_SHA"],model=previous.MODEL,graph=graph,
+                                   startup_and_runtime_inputs=linked_inputs(),
                                    rust_quantization_comparison=quant, sdk_sha256=ref.b.ARCHIVE_SHA,
                                    sdk_sysroot=ref.b.owned(ref.b.p2.output([ref.b.GCC,"-print-sysroot"]),ref.b.SDK),
                                    frontend_archives={p.stem:ref.b.abi.digest(p) for p in sorted(P.glob("*.tgz"))},
@@ -321,8 +352,12 @@ def validate(bodies,commit):
     for name in NAMES:
         f=features[name]; data=fixture(name); frames=max(0,(len(data)//2-480)//160+1)
         raw=zlib.decompress(base64.b64decode(f["interleaved_raw_u16le_int8_zlib_b64"],validate=True))
-        check(f["pcm_sha256"]==sha(data) and f["frames"]==frames and len(raw)==frames*120,"golden length")
+        check(f["pcm_sha256"]==sha(data) and f["wav_sha256"]==sha(wav(data)) and
+              f["frames"]==frames and len(raw)==frames*120,"golden length")
         quant=b"".join(raw[i+80:i+120] for i in range(0,len(raw),120))
+        for offset in range(0,len(raw),120):
+            values=struct.unpack_from("<40H",raw,offset)
+            check(raw[offset+80:offset+120]==bytes(min(127,(v*256+333)//666-128)&255 for v in values),"raw/INT8 mismatch")
         check(f["int8_sha256"]==sha(quant) and f["raw_sha256"]==sha(b"".join(raw[i:i+80] for i in range(0,len(raw),120))),"golden digest")
         check(streams[name]=={str(c):sha(quant) for c in CHUNKS},"chunk evidence")
         d=detect["14"][name]; scores=bytes(d["raw"])

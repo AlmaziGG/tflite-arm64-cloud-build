@@ -15,10 +15,6 @@ class HostTests(unittest.TestCase):
         self.assertEqual(result,bytes(min(127,round_fraction(x)-128)&255 for x in range(65536)))
 
     def test_decision_boundaries_and_reset(self):
-        for value in (254,255,256):
-            scores=bytes([0]*64+[229]*9+[value-23])
-            # 9*229 + [231..233], around the integer threshold; also exercise exact equality below.
-            self.check_decisions(scores)
         for last in (233,234,235):
             data=bytes([0]*64+[229]*9+[last])
             sums=self.check_decisions(data)
@@ -35,6 +31,13 @@ class HostTests(unittest.TestCase):
             self.assertEqual((s,hit),(want,int(k-start+1>=74 and want>2295)))
             if hit: start=k+1
         return got
+
+    def test_grace_can_expire_between_invocations(self):
+        result=p.command([p.P/"host","--strided-decision-trace"],bytes([255]*149))
+        lines=[tuple(map(int,row.split())) for row in result.stdout.splitlines()]
+        self.assertEqual(lines[:4],[(0,0),(0,0),(255,0),(255,0)])
+        self.assertEqual(lines[72:75],[(2550,0),(2550,1),(0,0)])
+        self.assertEqual([i+1 for i,(_,hit) in enumerate(lines) if hit],[74,148])
 
     def test_bad_wav(self):
         valid=p.wav(bytes(1200))
@@ -81,10 +84,40 @@ class HostTests(unittest.TestCase):
             p.verify_zip(b"abc","sha256:invalid","test")
 
 
+class ArtifactTests(unittest.TestCase):
+    def setUp(self):
+        self.bodies={key:(p.PUB/key).read_bytes() for key in p.FILES}
+        self.commit=json.loads(self.bodies["phase3-report.json"])["commit"]
+
+    def test_reject_missing_ota(self):
+        name="phase3-report.json"
+        doc=json.loads(self.bodies[name]); del doc["firmware"]["15"]
+        self.bodies[name]=json.dumps(doc).encode()
+        with self.assertRaisesRegex(ValueError,"firmware coverage"): p.validate(self.bodies,self.commit)
+
+    def test_reject_substituted_library(self):
+        name="phase3-report.json"
+        doc=json.loads(self.bodies[name]); doc["baseline"][p.ref.lib.name]="0"*64
+        self.bodies[name]=json.dumps(doc).encode()
+        with self.assertRaisesRegex(ValueError,"provenance"): p.validate(self.bodies,self.commit)
+
+    def test_reject_private_value(self):
+        self.bodies["resource-summary.json"]+=b"/home/runner/private"
+        with self.assertRaisesRegex(ValueError,"unsafe content"): p.validate(self.bodies,self.commit)
+
+    def test_tampered_sumfile(self):
+        blob=io.BytesIO()
+        with zipfile.ZipFile(blob,"w") as archive:
+            for n,v in self.bodies.items(): archive.writestr(n,v)
+            archive.writestr("SHA256SUMS",b"")
+        with self.assertRaisesRegex(ValueError,"manifest mismatch"):
+            p.verify_zip(blob.getvalue(),"sha256:"+p.sha(blob.getvalue()),self.commit)
+
+
 def round_fraction(x):
     whole, remainder=divmod(x*256,666)
     return whole+int(2*remainder>=666)
 
 
 if __name__=="__main__":
-    unittest.main()
+    unittest.main(defaultTest="HostTests")

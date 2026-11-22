@@ -112,7 +112,7 @@ using ModelPtr = const void *;
 #endif
 
 // CLI: runner MODEL TRACE_OR_- CHUNK_SAMPLES WAV... ; use - for continuous PCM stdin.
-static void session(ModelPtr model, FILE *source, bool raw, FILE *trace, unsigned chunk) {
+static void session(ModelPtr model, FILE *source, bool raw, FILE *trace, unsigned chunk, bool varying) {
     uint64_t remaining=raw?0:wave(source);
     auto start=Clock::now();
     Frontend fe(mww_frontend_create(),mww_frontend_destroy);
@@ -128,17 +128,21 @@ static void session(ModelPtr model, FILE *source, bool raw, FILE *trace, unsigne
     uint64_t samples=0, frames=0, invokes=0, dsp_ns=0, invoke_ns=0;
     std::array<int16_t,160> block{};
     std::array<int8_t,120> group{};
-    unsigned fill=0, rows=0;
+    unsigned fill=0, rows=0, peak_fill=0, peak_rows=0;
     Decision d;
     std::vector<uint8_t> input(chunk*2);
+    uint32_t seed=17;
     while(raw || remaining) {
-        size_t ask=raw?input.size():size_t(std::min<uint64_t>(input.size(),remaining));
+        seed=1664525u*seed+1013904223u;
+        size_t ask=varying ? 2*((seed>>16)%chunk+1) : input.size();
+        if(!raw) ask=size_t(std::min<uint64_t>(ask,remaining));
         size_t count=fread(input.data(),1,ask,source);
         require(!ferror(source) && (raw || count==ask) && !(count&1),"PCM read");
         if(!count) break;
         if(!raw) remaining-=count;
         for(size_t j=0;j<count;j+=2) {
             block[fill++]=int16_t(le16(&input[j])); ++samples;
+            peak_fill=std::max(peak_fill,fill);
             if(fill!=160) continue;
             fill=0;
             std::array<uint16_t,40> feature{};
@@ -150,6 +154,7 @@ static void session(ModelPtr model, FILE *source, bool raw, FILE *trace, unsigne
             auto dest=group.begin()+40*rows;
             std::transform(feature.begin(),feature.end(),dest,quant);
             ++frames; ++rows;
+            peak_rows=std::max(peak_rows,rows);
             int16_t score=-1;
             if(trace) {write_all(trace,feature.data(),80); write_all(trace,&*dest,40);}
             if(rows==3) {
@@ -180,10 +185,10 @@ static void session(ModelPtr model, FILE *source, bool raw, FILE *trace, unsigne
         }
     }
     require(samples>0,"empty PCM");
-    fprintf(stderr,"metrics %llu %llu %llu %llu %llu %llu %llu %llu\n",
+    fprintf(stderr,"metrics %llu %llu %llu %llu %llu %llu %llu %llu %u %u\n",
             (unsigned long long)samples,(unsigned long long)frames,(unsigned long long)invokes,
             (unsigned long long)fe_init,(unsigned long long)model_init,(unsigned long long)dsp_ns,
-            (unsigned long long)invoke_ns,(unsigned long long)ns(start));
+            (unsigned long long)invoke_ns,(unsigned long long)ns(start),peak_fill,peak_rows);
 }
 int main(int argc,char **argv) {
     try {
@@ -191,17 +196,22 @@ int main(int argc,char **argv) {
             for(unsigned i=0;i<=65535;++i) {int8_t v=quant(i); write_all(stdout,&v,1);}
             return fflush(stdout)!=0;
         }
-        if(argc==2 && !strcmp(argv[1],"--decision-trace")) {
-            Decision d; int c;
+        if(argc==2 && (!strcmp(argv[1],"--decision-trace") || !strcmp(argv[1],"--strided-decision-trace"))) {
+            Decision d; int c; unsigned row=0;
+            bool strided=!strcmp(argv[1],"--strided-decision-trace");
             while((c=getchar())!=EOF) {
-                bool hit=d.advance(c);
-                printf("%u %u\n",d.sum,unsigned(hit)); if(hit) d=Decision{};
+                row=(row+1)%3;
+                bool hit=d.advance(strided && row ? -1 : c);
+                printf("%u %u\n",d.sum,unsigned(hit));
+                if(hit) {d=Decision{}; row=0;}
             }
             return ferror(stdin) || fflush(stdout);
         }
         require(argc>=5,"usage: runner MODEL TRACE|- CHUNK_SAMPLES WAV|- ...");
         char *end=nullptr; unsigned long chunk=strtoul(argv[3],&end,10);
-        require(end!=argv[3] && !*end && chunk>=1 && chunk<=8192,"chunk");
+        bool varying=!strcmp(argv[3],"vary");
+        if(varying) chunk=1024;
+        else require(end!=argv[3] && !*end && chunk>=1 && chunk<=8192,"chunk");
         File trace(nullptr,fclose);
         if(strcmp(argv[2],"-")) {trace.reset(fopen(argv[2],"wb")); require(bool(trace),"trace open");}
 #ifndef FEATURES_ONLY
@@ -216,7 +226,7 @@ int main(int argc,char **argv) {
             bool raw=!strcmp(argv[i],"-");
             File f(raw?nullptr:fopen(argv[i],"rb"),fclose);
             require(raw || f,"WAV open");
-            session(m,raw?stdin:f.get(),raw,trace.get(),unsigned(chunk));
+            session(m,raw?stdin:f.get(),raw,trace.get(),unsigned(chunk),varying);
         }
         if(trace) require(fflush(trace.get())==0,"trace flush");
         return 0;
