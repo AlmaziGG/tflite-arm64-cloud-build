@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Regression tests for the Bazel JSONPROTO toolchain diagnostics path."""
 
+import hashlib
+import io
 import importlib.util
 import json
 import re
@@ -8,6 +10,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
+from unittest.mock import Mock
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -21,6 +25,7 @@ def load_module(name, filename):
     return module
 
 
+public = load_module("verify_public_artifact", "verify-public-artifact.py")
 collector = load_module("collect_bazel_toolchain", "collect-bazel-toolchain.py")
 sanitizer = load_module("sanitize_toolchain_report", "sanitize-toolchain-report.py")
 
@@ -449,7 +454,7 @@ class IntegrationAndSecurityTests(unittest.TestCase):
         self.assertIn("artifacts/toolchain-library-sanitized.txt", workflow)
         self.assertIn("artifacts/toolchain-smoke-sanitized.txt", workflow)
         self.assertIn("artifacts/SHA256SUMS", workflow)
-        self.assertIn("artifact-ids: ${{ steps.upload_public_artifact.outputs.artifact-id }}", workflow)
+        self.assertIn("artifact_id: ${{ steps.upload_public_artifact.outputs.artifact-id }}", workflow)
         self.assertIn("bash ./scripts/prepare-capsule-rootfs.sh", workflow)
         self.assertNotIn("actions-library.json", workflow)
         self.assertNotIn("actions-smoke.json", workflow)
@@ -507,6 +512,139 @@ libraries: =/usr/lib/aarch64-linux-gnu:/home/runner/work/private/sysroot/lib
         self.assertIn("compiler_libraries:", public)
         self.assertNotIn("/home/runner/", public)
         self.assertNotIn("/private/toolchain/", public)
+
+
+
+class PublicArtifactTests(unittest.TestCase):
+    def setUp(self):
+        self.env = dict(ARTIFACT_ID="12", GITHUB_RUN_ID="34", GITHUB_REPOSITORY="owner/repo",
+                        GITHUB_SHA="a" * 40, REPOSITORY_ID="56")
+        self.meta = dict(id=12, name=public.NAME, expired=False, digest="sha256:abc",
+                         workflow_run=dict(id=34, head_sha="a" * 40, repository_id=56, head_repository_id=56))
+        self.files = {name: b"sanitized report\n" for name in public.TOOLCHAINS}
+        header = ("Bazel 6.5.0 JSONPROTO structural diagnostics\n"
+                  "Observed query structure only; values, argv, environment contents and param-file contents are omitted.\n"
+                  "Include-flag comparisons are based on value-free structural profiles from real query results.\n")
+        queries = [f"QUERY {target}-{scope}-{flags}" for target in ("library", "smoke")
+                   for scope in ("deps", "direct") for flags in ("none", "commandline", "paramfiles", "commandline-paramfiles")]
+        self.files[public.STRUCTURE] = (header + "\n".join(queries)).encode()
+        self.manifest()
+
+    def manifest(self):
+        self.files["SHA256SUMS"] = "".join(f"{hashlib.sha256(self.files[n]).hexdigest()}  {n}\n"
+                                          for n in public.REPORTS).encode()
+
+    def verify(self, digest=None):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as output:
+            for name, data in self.files.items():
+                output.writestr(name, data)
+        data = archive.getvalue()
+        with tempfile.TemporaryDirectory() as directory:
+            public.verify_zip(data, digest or "sha256:" + hashlib.sha256(data).hexdigest(), Path(directory))
+
+    def test_valid_zip_manifest_and_safety(self):
+        self.verify()
+
+    def test_exact_id_and_retry_after_temporary_zip_failure(self):
+        get = Mock(side_effect=[json.dumps(self.meta), public.TemporarilyUnavailable("404"),
+                                json.dumps(self.meta), b"ZIP"])
+        pause = Mock()
+        self.assertEqual(public.download(self.env, get, pause), (b"ZIP", "sha256:abc"))
+        endpoint = "https://api.github.com/repos/owner/repo/actions/artifacts/12"
+        self.assertEqual([call.args[0] for call in get.call_args_list], [endpoint, endpoint + "/zip"] * 2)
+        pause.assert_called_once_with(5)
+
+    def test_retry_exhaustion_fails(self):
+        get = Mock(side_effect=public.TemporarilyUnavailable("404"))
+        pause = Mock()
+        with self.assertRaisesRegex(ValueError, "after five"):
+            public.download(self.env, get, pause)
+        self.assertEqual((get.call_count, pause.call_count), (5, 4))
+
+    def test_wrong_identity_or_permission_failure_never_retried(self):
+        for invalid in (dict(id=13), dict(name="other"), dict(expired=True),
+                        *(dict(workflow_run=self.meta["workflow_run"] | {key: 0}) for key in self.meta["workflow_run"])):
+            get = Mock(return_value=json.dumps(self.meta | invalid))
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                public.download(self.env, get)
+            get.assert_called_once()
+        get = Mock(side_effect=ValueError("HTTP 403"))
+        with self.assertRaisesRegex(ValueError, "403"):
+            public.download(self.env, get)
+        get.assert_called_once()
+
+    def test_empty_id_never_downloads(self):
+        get = Mock()
+        with self.assertRaises(ValueError):
+            public.download(self.env | {"ARTIFACT_ID": ""}, get)
+        get.assert_not_called()
+
+    def test_forbidden_member_or_empty_report(self):
+        for name in ("work/private-diagnostics/raw.json", "execve.trace", "../report", "bazel-cache/data"):
+            self.files[name] = b"x"
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.verify()
+            del self.files[name]
+        self.files[public.TOOLCHAINS[0]] = b""
+        with self.assertRaises(ValueError):
+            self.verify()
+
+    def test_manifest_names_count_format_and_uniqueness(self):
+        rows = self.files["SHA256SUMS"].splitlines(keepends=True)
+        for bad in (rows[:2], rows + rows[:1], [rows[0], rows[0], rows[2]], [b"invalid\n", *rows[1:]],
+                    [rows[0].replace(b"  ", b"  ../"), *rows[1:]]):
+            self.files["SHA256SUMS"] = b"".join(bad)
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.verify()
+
+    def test_archive_digest_and_report_digest_are_independent(self):
+        with self.assertRaisesRegex(ValueError, "ZIP digest"):
+            self.verify("sha256:" + "0" * 64)
+        self.files[public.TOOLCHAINS[1]] += b"changed"
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.verify()
+
+    def test_rehashed_unsafe_report_still_fails(self):
+        self.files[public.TOOLCHAINS[0]] = b"raw_command=private\n"
+        self.manifest()
+        with self.assertRaisesRegex(ValueError, "unsafe"):
+            self.verify()
+
+    def test_required_action_fields_fail_closed(self):
+        common = "compiler_resolution_status=RESOLVED: test\neffective_sysroot_status=RESOLVED: test\n"
+        text = ("ACTION CppCompile #1\n" + common + "ACTION CppLink #1\n" + common
+                + "actual_linker_identity_status=RESOLVED\nlinker_resolution_status=RESOLVED: test\n"
+                  "linker_trace_action_exit=0\ncollector_exit_code=0\n")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report"
+            path.write_text(text)
+            public.check_production(path)
+            for bad in (text.replace("RESOLVED", "NOT RESOLVED", 1), text.replace("collector_exit_code=0", ""),
+                        text.replace("actual_linker_identity_status=RESOLVED", ""), text.replace("action_exit=0", "action_exit=1")):
+                path.write_text(bad)
+                with self.assertRaises(ValueError):
+                    public.check_production(path)
+
+    def test_workflow_verifies_published_artifact_even_after_inspect_failure(self):
+        workflow = (SCRIPTS.parent / ".github/workflows/diagnose-bazel-jsonproto.yml").read_text()
+        inspect, verify = workflow.split("\n  verify_artifact:\n")
+        self.assertIn("outputs:\n      artifact_id: ${{ steps.upload_public_artifact.outputs.artifact-id }}", inspect)
+        self.assertIn("needs: inspect", verify)
+        self.assertIn("!cancelled()", verify)
+        self.assertIn("permissions:\n      contents: read\n      actions: read", verify)
+        self.assertIn("ARTIFACT_ID: ${{ needs.inspect.outputs.artifact_id }}", verify)
+        self.assertNotIn("continue-on-error", verify)
+        self.assertIn("run: python3 ./scripts/verify-public-artifact.py", verify)
+        gate = inspect.split("- name: Require successful production diagnostics and upload", 1)[1]
+        self.assertIn("steps.production_diagnostics.outcome", gate)
+        self.assertIn('"$PRODUCTION_OUTCOME" == success', gate)
+        self.assertIn("production-gate", gate)
+        self.assertIn("Remove private JSONPROTO diagnostics\n        if: always()", gate)
+        self.assertEqual(re.search(r"branches:\s*\n(.*?)\n  workflow_dispatch:", inspect, re.S)[1].strip(),
+                         "- codex/jsonproto-phase0-diagnostics-20261122")
+        paths = re.search(r"path: \|\n(.*?)\n          if-no-files-found: error", inspect, re.S)[1].splitlines()
+        self.assertEqual(sorted(path.strip() for path in paths), sorted(f"artifacts/{n}" for n in public.MEMBERS))
 
 
 if __name__ == "__main__":

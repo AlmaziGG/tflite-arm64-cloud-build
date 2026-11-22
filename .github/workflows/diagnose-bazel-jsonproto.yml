@@ -16,6 +16,8 @@ concurrency:
 jobs:
   inspect:
     runs-on: ubuntu-24.04
+    outputs:
+      artifact_id: ${{ steps.upload_public_artifact.outputs.artifact-id }}
     timeout-minutes: 360
     steps:
       - name: Checkout build scripts
@@ -32,10 +34,14 @@ jobs:
           chmod 700 "$private_dir"
           printf 'JSONPROTO_PRIVATE_DIR=%s\n' "$private_dir" >> "$GITHUB_ENV"
 
-      - name: Check inspector Python syntax
+      - name: Check Python, Bash and workflow YAML syntax
         env:
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}/jsonproto-python-cache
-        run: python3 -m py_compile ./scripts/inspect-bazel-jsonproto.py
+        shell: bash
+        run: |
+          python3 -m py_compile ./scripts/inspect-bazel-jsonproto.py ./scripts/verify-public-artifact.py
+          for script in scripts/*.sh; do bash -n "$script"; done
+          ruby -rpsych -e 'Psych.parse_file(ARGV.fetch(0))' .github/workflows/diagnose-bazel-jsonproto.yml
 
       - name: Preflight runner and existing regression tests
         run: bash ./scripts/preflight.sh
@@ -90,23 +96,11 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          python3 ./scripts/verify-public-artifact.py check-sanitized
           python3 - <<'PY'
           from pathlib import Path
-          import re
           root = Path("artifacts")
           reports = [root / "toolchain-library-sanitized.txt", root / "toolchain-smoke-sanitized.txt"]
-          forbidden = ("ACTION_SECRET", "Bearer ", "ghp_", "github_pat_", "raw_command=", "action_dump=", "response_file_contents=")
-          for report in reports:
-              if not report.is_file() or report.stat().st_size == 0:
-                  raise SystemExit(f"SANITIZED REPORT CHECK FAILED: {report.name} missing or empty")
-              content = report.read_text(encoding="utf-8")
-              if any(marker.lower() in content.lower() for marker in forbidden):
-                  raise SystemExit(f"SANITIZED REPORT CHECK FAILED: forbidden marker in {report.name}")
-              if "execve(" in content or re.search(r"(?m)(?:^|[\s=])/(?!/)", content):
-                  raise SystemExit(f"SANITIZED REPORT CHECK FAILED: executable trace or absolute path in {report.name}")
-              if re.search(r"(?m)(?:/home/runner/|/tmp/|[A-Za-z]:\\)", content):
-                  raise SystemExit(f"SANITIZED REPORT CHECK FAILED: private path in {report.name}")
-              print(f"SANITIZED REPORT CHECK PASSED: {report.name} ({report.stat().st_size} bytes)")
           manifest_files = [root / "bazel-jsonproto-structure-report.txt", *reports]
           for item in manifest_files:
               if not item.is_file() or item.stat().st_size == 0:
@@ -152,53 +146,19 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Download and verify published artifact contents
-        if: always() && steps.upload_public_artifact.outcome == 'success'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          artifact-ids: ${{ steps.upload_public_artifact.outputs.artifact-id }}
-          path: ${{ runner.temp }}/jsonproto-artifact-verify
-
-      - name: Verify downloaded manifest and artifact allowlist
-        if: always() && steps.upload_public_artifact.outcome == 'success'
+      - name: Require successful production diagnostics and upload
+        if: always()
         shell: bash
+        env:
+          PRODUCTION_OUTCOME: ${{ steps.production_diagnostics.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload_public_artifact.outcome }}
+          ARTIFACT_ID: ${{ steps.upload_public_artifact.outputs.artifact-id }}
         run: |
-          set -Eeuo pipefail
-          downloaded="$RUNNER_TEMP/jsonproto-artifact-verify"
-          expected="$RUNNER_TEMP/jsonproto-artifact-expected.txt"
-          actual="$RUNNER_TEMP/jsonproto-artifact-actual.txt"
-          cat > "$expected" <<'EOF'
-          SHA256SUMS
-          bazel-jsonproto-structure-report.txt
-          toolchain-library-sanitized.txt
-          toolchain-smoke-sanitized.txt
-          EOF
-          find "$downloaded" -type f -printf '%P\n' | LC_ALL=C sort > "$actual"
-          LC_ALL=C sort -o "$expected" "$expected"
-          if ! cmp -s "$expected" "$actual"; then
-            echo 'Downloaded artifact file list does not match the exact upload allowlist.' >&2
-            diff -u "$expected" "$actual" >&2 || true
+          [[ "$PRODUCTION_OUTCOME" == success && "$UPLOAD_OUTCOME" == success && "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "Required diagnostics or upload failed (production=$PRODUCTION_OUTCOME, upload=$UPLOAD_OUTCOME)." >&2
             exit 1
-          fi
-          (cd "$downloaded" && sha256sum --check --strict SHA256SUMS)
-          manifest_names="$RUNNER_TEMP/jsonproto-manifest-names.txt"
-          awk '{print $2}' "$downloaded/SHA256SUMS" | LC_ALL=C sort > "$manifest_names"
-          expected_manifest="$RUNNER_TEMP/jsonproto-expected-manifest-names.txt"
-          printf '%s\n' bazel-jsonproto-structure-report.txt toolchain-library-sanitized.txt toolchain-smoke-sanitized.txt | LC_ALL=C sort > "$expected_manifest"
-          if ! cmp -s "$expected_manifest" "$manifest_names"; then
-            echo 'Downloaded SHA256SUMS entries do not match the three published reports.' >&2
-            exit 1
-          fi
-          if grep -REn '/home/runner/|/tmp/|[A-Za-z]:\\|ACTION_SECRET|Bearer |ghp_|github_pat_|raw_command=|action_dump=|response_file_contents=|execve\(' \
-              "$downloaded/toolchain-library-sanitized.txt" "$downloaded/toolchain-smoke-sanitized.txt"; then
-            echo 'Downloaded sanitized report contains a forbidden path, token marker, or private trace marker.' >&2
-            exit 1
-          fi
-          echo 'Downloaded artifact allowlist and all three SHA-256 entries verified.'
-          echo '--- Verified downloaded library toolchain report (sanitized) ---'
-          cat "$downloaded/toolchain-library-sanitized.txt"
-          echo '--- Verified downloaded smoke toolchain report (sanitized) ---'
-          cat "$downloaded/toolchain-smoke-sanitized.txt"
+          }
+          python3 ./scripts/verify-public-artifact.py production-gate
 
       - name: Remove private JSONPROTO diagnostics
         if: always()
@@ -233,16 +193,24 @@ jobs:
                 ;;
             esac
           fi
-          artifact_verify_dir="$RUNNER_TEMP/jsonproto-artifact-verify"
-          if [[ -d "$artifact_verify_dir" ]]; then
-            case "$artifact_verify_dir" in
-              "$RUNNER_TEMP/jsonproto-artifact-verify")
-                rm -rf -- "$artifact_verify_dir"
-                echo 'Removed downloaded sanitized artifact verification copy.'
-                ;;
-              *)
-                echo 'Refusing cleanup outside the artifact verification temp path.' >&2
-                exit 1
-                ;;
-            esac
-          fi
+
+  verify_artifact:
+    needs: inspect
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout verification scripts from this run
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download published ZIP by ID and verify contents
+        env:
+          ARTIFACT_ID: ${{ needs.inspect.outputs.artifact_id }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 ./scripts/verify-public-artifact.py
