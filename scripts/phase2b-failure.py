@@ -43,13 +43,13 @@ for target in ("library", "smoke"):
     private = Path(f"work/private-diagnostics/toolchain-{target}.txt")
     if private.is_file():
         for line in private.read_text().splitlines():
-            if re.fullmatch(r"tf2_comparison=[-#a-z]+ (different|unsuccessful|unexpected|foreign-root|different-stderr|equal-stderr|same-directory)", line):
+            if re.fullmatch(r"tf2_comparison=[-#a-z]+ (different|unsuccessful|unexpected|foreign-root|different-stderr|equal-stderr|same-directory|pinned-assembler|no-recognized-backend)", line):
                 print(target, line)
             match = re.match(r"ERROR \[([\w-]+)\]|collector_failure_category=([\w-]+)", line)
             if match:
                 print(target, "category", match[1] or match[2])
             match = re.match(r"  effective_sysroot_status=NOT RESOLVED: ([\w /.-]+)$", line)
-            if match and "/" not in match[1]:
+            if match and ("/" not in match[1] or match[1] == "unreviewed action environment keys may alter compiler/wrapper behavior"):
                 print(target, match[1])
 for log in Path("work/private-diagnostics").glob("abi-*-console.txt"):
     print("closure report", log.name, log.stat().st_size, "bytes")
@@ -63,4 +63,10 @@ diagnostic = Path(os.environ["RUNNER_TEMP"]) / "p2b-diagnostics"
 if diagnostic.is_file():
     for line in diagnostic.read_text().splitlines():
         if re.fullmatch(r"DIAGNOSTIC FAILURE: [a-zA-Z0-9 ()=-]+", line):
+            print(line)
+
+qemu = Path("artifacts/qemu.log")
+if qemu.is_file():
+    for line in qemu.read_text(errors="replace").splitlines():
+        if re.fullmatch(r"Capsule-(14|15) QEMU: (PASS|FAIL \(exit=\d+\))|invoke=ok output type=\d+ bytes=\d+|output\[0\]=[-0-9.e+]+", line):
             print(line)

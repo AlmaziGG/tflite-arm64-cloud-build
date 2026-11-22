@@ -47,6 +47,7 @@ jobs:
           cmp work/tensorflow/bazel-bin/tensorflow/lite/c/cloud_smoke/tflite_smoke artifacts/tflite_smoke
       - name: Strict library audits against both firmware roots
         id: libabi
+        if: ${{ !cancelled() && steps.library.outcome == 'success' }}
         run: bash scripts/verify-abi.sh > "$RUNNER_TEMP/p2b-libabi" 2>&1
       - name: Strict smoke audits against both firmware roots
         id: exeabi
@@ -70,7 +71,7 @@ jobs:
           exit "$rc"
       - name: QEMU invoke and guest loader verification on both roots
         id: qemu
-        if: success() && steps.libabi.outcome == 'success' && steps.exeabi.outcome == 'success' && steps.diagnostics.outcome == 'success'
+        if: ${{ !cancelled() && steps.libabi.outcome == 'success' && steps.exeabi.outcome == 'success' }}
         run: |
           python3 scripts/phase2b.py matrix
           bash scripts/run-smoke-test.sh > "$RUNNER_TEMP/p2b-qemu" 2>&1

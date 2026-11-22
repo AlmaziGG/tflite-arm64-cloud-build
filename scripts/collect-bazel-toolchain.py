@@ -121,6 +121,33 @@ def decide_effective_sysroot(explicit_paths, environment_hints, environment_capt
     return default_sysroot, "RESOLVED", "compiler default/configuration under captured no-override action environment"
 
 
+def pinned_assembler_plan(plan, driver, cwd):
+    """GCC can dispatch raw .s input straight to GNU as without running cc1."""
+    sdk = Path(driver).resolve().parents[1]
+    expected = sdk / "bin/aarch64-none-linux-gnu-as"
+    if not expected.is_file():
+        return False
+    for line in plan.splitlines():
+        if not line.startswith(" "):
+            continue
+        try:
+            words = shlex.split(line)
+        except ValueError:
+            continue
+        if words and "-o" in words:
+            as_path = (Path(cwd) / words[0]).resolve()
+            if as_path.is_relative_to(sdk) and as_path.is_file() and as_path.samefile(expected):
+                return True
+            # Arm distributions may ship two identical copies under bin/ and
+            # target/bin/. Compare contents only inside the pinned SDK.
+            if (as_path.is_relative_to(sdk) and as_path.is_file()
+                    and as_path.name in ("as", expected.name)
+                    and hashlib.sha256(as_path.read_bytes()).digest() == hashlib.sha256(expected.read_bytes()).digest()):
+                return True
+    return False
+
+
+
 def compare_tf2_probes(driver, argv, env, cwd, default, probe=None, *, gcc_version="11.3.1", evidence=None):
     """Only called for a direct pinned ARM GCC with one unreviewed key."""
     if env.get("TF2_BEHAVIOR") != "1" or not default:
@@ -150,7 +177,11 @@ def compare_tf2_probes(driver, argv, env, cwd, default, probe=None, *, gcc_versi
             pattern = r"/tmp/cc[A-Za-z0-9]{6}(?=[.][\w.]+(?:\s|\"|$))"
             a, b = (re.sub(pattern, "/tmp/<gcc-temp>", x) for x in (a, b))
             if not re.search(r"(?:/cc1(?:plus)?|/collect2)(?:\"|\s)", a):
-                return False
+                if gcc_version == "10.3.1" and pinned_assembler_plan(a, driver, cwd):
+                    if evidence is not None:
+                        evidence.append("-### pinned-assembler")
+                else:
+                    return reject("-###", "no-recognized-backend")
         if a != b:
             return reject(args[-1], "different")
         expected = {"-dumpfullversion": gcc_version, "-dumpmachine": "aarch64-none-linux-gnu",

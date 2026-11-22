@@ -104,6 +104,25 @@ class CompatibilityTests(unittest.TestCase):
             self.assertFalse(check(alias, 'echo "$TF2_BEHAVIOR"'))
 
 
+    def test_assembler_only_plan_bound_to_pinned_sdk(self):
+        collector = build.load("collect-bazel-toolchain.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdk = root / "sdk"
+            tools = sdk / "bin"
+            tools.mkdir(parents=True)
+            driver = tools / "aarch64-none-linux-gnu-gcc"
+            expected = tools / "aarch64-none-linux-gnu-as"
+            expected.write_bytes(b"known")
+            alias = sdk / "as"
+            alias.write_bytes(b"known")
+            foreign = root / "as"
+            foreign.write_bytes(b"known")
+            for exe, valid in ((expected, True), (alias, True), (foreign, False)):
+                self.assertEqual(collector.pinned_assembler_plan(f' "{exe}" -o src.o src.s', driver, root), valid)
+            alias.write_bytes(b"other")
+            self.assertFalse(collector.pinned_assembler_plan(f' "{alias}" -o src.o src.s', driver, root))
+
     def test_real_checksum_rejection(self):
         import subprocess
         with tempfile.TemporaryDirectory() as directory:
