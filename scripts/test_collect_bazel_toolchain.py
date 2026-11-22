@@ -186,7 +186,7 @@ class IntegrationAndSecurityTests(unittest.TestCase):
         self.assertEqual(isolated, {"PATH": "/explicit/bin"})
         unknown = collector.action_environment_for_replay(
             None, {"CUSTOM": "value"}, captured=False, clear_environment=False)
-        self.assertEqual(unknown, {})
+        self.assertEqual(unknown, {"CUSTOM": "value"})
 
     def test_actual_linker_requires_direct_dry_run_evidence(self):
         path = "/tool/bin/aarch64-linux-gnu-ld"

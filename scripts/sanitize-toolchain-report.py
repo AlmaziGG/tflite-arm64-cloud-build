@@ -55,7 +55,7 @@ def sanitize(source, destination):
         "actual_linker_implementation=", "actual_linker_version=", "actual_linker_target_architecture=",
         "actual_linker_identity_status=",
         "linker_trace_status=", "linker_trace_action_exit=", "linker_trace_output_redirect_status=",
-        "CppLink_linker_candidate_path=", "linker_evidence=", "linker_driver_helper=",
+        "CppLink_linker_candidate_path=", "linker_driver_helper=",
         "compiler_resolution_status=", "effective_sysroot_status=", "linker_resolution_status=",
         "action_environment_status=", "action_sysroot_status=", "wrapper_dry_run_sysroot_arguments=",
         "actual_compiler_identification_evidence=", "linker_identification=",
@@ -131,9 +131,6 @@ def sanitize(source, destination):
                 continue
             if normalized.startswith("CppLink_linker_candidate_version_exit=") or normalized.startswith("actual_linker_version_exit="):
                 metadata_mode = None
-                continue
-            if normalized.startswith("actual_selected_linker=") and "UNRESOLVED" not in normalized:
-                metadata_mode = "actual_linker_version"
                 continue
             if normalized.startswith("linker_evidence="):
                 evidence = normalized.partition("=")[2]
