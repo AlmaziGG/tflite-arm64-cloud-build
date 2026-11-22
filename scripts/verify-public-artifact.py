@@ -51,12 +51,14 @@ def check_production(path):
                 raise ValueError(f"{path.name}: missing or unresolved {kind} {field}")
 
 
-def verify_zip(data, digest, directory):
+def verify_zip(data, digest, directory, *, structure=STRUCTURE, validate_structure=None):
+    reports = (structure, *TOOLCHAINS)
+    members = {*reports, "SHA256SUMS"}
     if digest != "sha256:" + hashlib.sha256(data).hexdigest():
         raise ValueError("published ZIP digest mismatch")
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         entries = archive.infolist()
-        if len(entries) != len(MEMBERS) or {item.orig_filename for item in entries} != MEMBERS:
+        if len(entries) != len(members) or {item.orig_filename for item in entries} != members:
             raise ValueError("ZIP does not match exact four-file allowlist")
         for item in entries:
             if not 0 < item.file_size <= MAX_BYTES or stat.S_IFMT(item.external_attr >> 16) not in (0, stat.S_IFREG):
@@ -65,11 +67,14 @@ def verify_zip(data, digest, directory):
     manifest = (directory / "SHA256SUMS").read_bytes()
     rows = re.findall(rb"^[0-9a-f]{64}  ([a-z0-9.-]+)\n", manifest, re.M)
     if (not re.fullmatch(rb"(?:[0-9a-f]{64}  [a-z0-9.-]+\n){3}", manifest)
-            or sorted(name.decode("ascii") for name in rows) != sorted(REPORTS)):
+            or sorted(name.decode("ascii") for name in rows) != sorted(reports)):
         raise ValueError("invalid three-file manifest")
     subprocess.run(["sha256sum", "--check", "--strict", "SHA256SUMS"], cwd=directory, check=True)
     for name in TOOLCHAINS:
         check_sanitized(directory / name)
+    if validate_structure is not None:
+        validate_structure(directory / structure)
+        return
     inspector = Path(__file__).with_name("inspect-bazel-jsonproto.py")
     subprocess.run([sys.executable, str(inspector), "--validate-report", str(directory / STRUCTURE)], check=True)
 
@@ -99,7 +104,7 @@ def request(url):
         return body.read()
 
 
-def download(env, get=request, sleep=time.sleep):
+def download(env, get=request, sleep=time.sleep, *, name=NAME):
     artifact_id = env["ARTIFACT_ID"]
     if not re.fullmatch(r"[1-9][0-9]*", artifact_id):
         raise ValueError("missing or invalid upload artifact ID")
@@ -108,7 +113,7 @@ def download(env, get=request, sleep=time.sleep):
         try:
             metadata = json.loads(get(url))
             run = metadata["workflow_run"]
-            if (metadata["id"] != int(artifact_id) or metadata["name"] != NAME or metadata["expired"]
+            if (metadata["id"] != int(artifact_id) or metadata["name"] != name or metadata["expired"]
                     or run["id"] != int(env["GITHUB_RUN_ID"]) or run["head_sha"] != env["GITHUB_SHA"]
                     or run["repository_id"] != int(env["REPOSITORY_ID"])
                     or run["head_repository_id"] != int(env["REPOSITORY_ID"])):

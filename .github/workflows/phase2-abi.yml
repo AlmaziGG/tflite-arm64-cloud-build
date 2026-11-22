@@ -1,0 +1,102 @@
+name: Phase 2A ARM64 ABI evidence
+on:
+  push:
+    branches: [codex/phase2-abi-investigation-20261122]
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      artifact_id: ${{ steps.publish.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check baseline and preflight
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          base=e79e64c16264ef89e15e76b7b61c5d5d4045c68b
+          git merge-base --is-ancestor "$base" HEAD
+          git diff --check "$base" HEAD
+          git diff --exit-code "$base" HEAD -- scripts/{common,build-tflite,prepare-smoke-test,prepare-capsule-rootfs,verify-abi,verify-smoke-abi,run-smoke-test}.sh scripts/{verify_elf_abi,collect-bazel-toolchain}.py
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test ! -e work
+          test ! -e artifacts
+          python3 -m py_compile scripts/*.py
+          for path in scripts/*.sh; do bash -n "$path"; done
+          ruby -rpsych -e 'Psych.parse_file(ARGV.fetch(0))' .github/workflows/phase2-abi.yml
+          bash scripts/preflight.sh
+      - name: Prepare both pinned firmware roots
+        run: bash scripts/prepare-capsule-rootfs.sh > "$RUNNER_TEMP/phase2-ota" 2>&1
+      - name: Build both baseline artifacts with the pinned configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash scripts/build-tflite.sh > "$RUNNER_TEMP/phase2-build" 2>&1
+          bash scripts/prepare-smoke-test.sh > "$RUNNER_TEMP/phase2-smoke" 2>&1
+          cmp work/tensorflow/bazel-bin/tensorflow/lite/c/libtensorflowlite_c.so artifacts/libtensorflowlite_c.so
+          cmp work/tensorflow/bazel-bin/tensorflow/lite/c/cloud_smoke/tflite_smoke artifacts/tflite_smoke
+          for log in artifacts/{build,smoke-build}.log; do
+            grep -Eo 'INFO: [0-9]+ processes: [0-9]+ internal, [1-9][0-9]* (local|linux-sandbox)\.' "$log"
+          done
+      - name: Run four independent strict audits and record acceptance
+        run: |
+          mkdir -m 700 -p work/private-diagnostics
+          python3 scripts/phase2-evidence.py strict
+      - name: Collect baseline toolchain and closure diagnostics
+        run: |
+          bash scripts/collect-diagnostics.sh > "$RUNNER_TEMP/phase2-diagnostics" 2>&1
+          python3 scripts/verify-public-artifact.py check-sanitized
+          python3 scripts/verify-public-artifact.py production-gate
+      - name: Attribute symbols and compare firmware providers
+        run: python3 scripts/phase2-evidence.py collect
+      - name: Validate exact public inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/phase2-evidence.py validate artifacts/phase2-evidence.json
+          cd artifacts
+          sha256sum phase2-evidence.json toolchain-{library,smoke}-sanitized.txt > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - id: publish
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: phase2-abi-evidence
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            artifacts/phase2-evidence.json
+            artifacts/toolchain-library-sanitized.txt
+            artifacts/toolchain-smoke-sanitized.txt
+            artifacts/SHA256SUMS
+      - name: Remove private diagnostics and build inputs
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$PWD" = "$GITHUB_WORKSPACE"
+          rm -rf -- work artifacts
+          rm -f -- "$RUNNER_TEMP"/phase2-{diagnostics,build,smoke,ota}
+
+  verify_artifact:
+    needs: baseline
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - name: Independently download and verify evidence
+        env:
+          ARTIFACT_ID: ${{ needs.baseline.outputs.artifact_id }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/phase2-evidence.py verify
