@@ -60,11 +60,14 @@ jobs:
           set -Eeuo pipefail
           mkdir -p -m 700 work/private-diagnostics
           python3 scripts/phase2-evidence.py strict
-          bash scripts/collect-diagnostics.sh > "$RUNNER_TEMP/p2b-diagnostics" 2>&1
+          rc=0
+          bash scripts/collect-diagnostics.sh > "$RUNNER_TEMP/p2b-diagnostics" 2>&1 || rc=$?
+          echo "Production diagnostics exit=$rc"
           python3 scripts/verify-public-artifact.py check-sanitized
-          python3 scripts/verify-public-artifact.py production-gate
+          python3 scripts/verify-public-artifact.py production-gate || rc=1
           python3 scripts/phase2-evidence.py collect
           python3 scripts/phase2b.py report
+          exit "$rc"
       - name: QEMU invoke and guest loader verification on both roots
         id: qemu
         if: success() && steps.libabi.outcome == 'success' && steps.exeabi.outcome == 'success' && steps.diagnostics.outcome == 'success'

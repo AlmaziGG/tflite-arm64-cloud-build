@@ -121,9 +121,13 @@ def decide_effective_sysroot(explicit_paths, environment_hints, environment_capt
     return default_sysroot, "RESOLVED", "compiler default/configuration under captured no-override action environment"
 
 
-def compare_tf2_probes(driver, argv, env, cwd, default, probe=run, *, gcc_version="11.3.1"):
+def compare_tf2_probes(driver, argv, env, cwd, default, probe=run, *, gcc_version="11.3.1", evidence=None):
     """Only called for a direct pinned ARM GCC with one unreviewed key."""
     if env.get("TF2_BEHAVIOR") != "1" or not default:
+        return False
+    def reject(flag, reason):
+        if evidence is not None:
+            evidence.append(f"{flag} {reason}")
         return False
     without = env.copy()
     del without["TF2_BEHAVIOR"]
@@ -131,7 +135,7 @@ def compare_tf2_probes(driver, argv, env, cwd, default, probe=run, *, gcc_versio
                  [*argv[1:], "-print-sysroot"], [*argv[1:], "-###"]):
         pair = [probe([str(driver), *args], cwd=cwd, env=e) for e in (env, without)]
         if any(p.returncode or not p.stdout.strip() for p in pair):
-            return False
+            return reject(args[-1], "unsuccessful")
         a, b = (p.stdout.strip() for p in pair)
         if args[-1] == "-###":
             # GCC generates a fresh name for each temporary assembler or LTO file.
@@ -140,11 +144,11 @@ def compare_tf2_probes(driver, argv, env, cwd, default, probe=run, *, gcc_versio
             if not re.search(r"(?:/cc1(?:plus)?|/collect2)(?:\"|\s)", a):
                 return False
         if a != b:
-            return False
+            return reject(args[-1], "different")
         expected = {"-dumpfullversion": gcc_version, "-dumpmachine": "aarch64-none-linux-gnu",
                     "-print-sysroot": default}
         if args[-1] in expected and a != expected[args[-1]]:
-            return False
+            return reject(args[-1], "unexpected")
     return True
 
 
@@ -1067,14 +1071,18 @@ def main(argv):
                     - (RELEVANT_ENVIRONMENT | {"LANG", "LC_ALL", "HOME", "TMPDIR", "TMP", "TEMP", "PWD", "LD_LIBRARY_PATH", "LD_PRELOAD", "SOURCE_DATE_EPOCH"})
                 )
                 print(f"  unreviewed_action_environment_key_names={','.join(unreviewed_environment_keys) if unreviewed_environment_keys else '<none>'}", file=stream)
+                tf2_evidence = []
                 tf2_verified = (unreviewed_environment_keys == ["TF2_BEHAVIOR"] and
                                 not any(child_env.get(k) for k in ("LD_LIBRARY_PATH", "LD_PRELOAD")) and
                                 not is_wrapper and environment_is_captured and not unresolved_response_files and
-                                launcher.name == "aarch64-none-linux-gnu-gcc" and
                                 "aarch64_linux_toolchain" in toolchain_roots and
                                 launcher.is_relative_to(toolchain_roots["aarch64_linux_toolchain"]) and
+                                launcher == (toolchain_roots["aarch64_linux_toolchain"] / "bin/aarch64-none-linux-gnu-gcc").resolve() and
                                 compare_tf2_probes(launcher, expanded_argv, child_env, execution_root, default_sysroot,
-                                                   gcc_version="10.3.1" if os.environ.get("CAPSULE_ARMGNU103") == "1" else "11.3.1"))
+                                                   gcc_version="10.3.1" if os.environ.get("CAPSULE_ARMGNU103") == "1" else "11.3.1",
+                                                   evidence=tf2_evidence))
+                for detail in tf2_evidence:
+                    print(f"tf2_comparison={detail}", file=stream)
                 if tf2_verified:
                     unreviewed_environment_keys = []
                 effective_value, effective_status, sysroot_provenance = decide_effective_sysroot(
