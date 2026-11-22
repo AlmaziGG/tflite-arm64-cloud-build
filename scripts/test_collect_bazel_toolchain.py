@@ -170,6 +170,28 @@ class JsonProtoCollectorTests(unittest.TestCase):
 
 
 class IntegrationAndSecurityTests(unittest.TestCase):
+    def test_tf2_exception_requires_equal_action_probes(self):
+        values = {"-dumpfullversion": "11.3.1", "-dumpmachine": "aarch64-none-linux-gnu",
+                  "-dumpspecs": "*link:", "-print-sysroot": "/pinned", "-###": "/bin/collect2 -o output"}
+        for changed in [None, *values]:
+            def probe(cmd, *, cwd, env):
+                flag = cmd[-1]
+                value = values[flag]
+                if flag == changed and "TF2_BEHAVIOR" not in env:
+                    value += " different"
+                return subprocess.CompletedProcess(cmd, 0, stdout=value)
+            self.assertEqual(collector.compare_tf2_probes("gcc", ["gcc"], {"TF2_BEHAVIOR": "1"},
+                                                         ".", "/pinned", probe), changed is None)
+
+    def test_classify_missing_replay_input_without_publishing_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            item = "bazel-out/arm-fastbuild/bin/private.o"
+            findings = collector.replay_findings(["gcc", "-o", "target.so", item], Path(directory),
+                                                 "ld: cannot find " + item)
+        self.assertIn("inputs=1,missing=1", findings)
+        self.assertIn("missing-fastbuild-input-named-by-linker", findings)
+        self.assertNotIn(item, findings)
+
     def test_wrapper_dry_run_identifies_compiler(self):
         self.assertEqual(collector.compiler_tokens_from_dry_run('COLLECT_GCC="/opt/cross/bin/aarch64-linux-gnu-gcc"\n'), ["/opt/cross/bin/aarch64-linux-gnu-gcc"])
 

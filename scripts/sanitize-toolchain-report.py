@@ -54,7 +54,7 @@ def sanitize(source, destination):
         "wrapper_or_environment_sysroot=", "actual_selected_linker=", "actual_linker_basename=",
         "actual_linker_implementation=", "actual_linker_version=", "actual_linker_target_architecture=",
         "actual_linker_identity_status=",
-        "linker_trace_status=", "linker_trace_action_exit=", "linker_trace_output_redirect_status=",
+        "linker_trace_status=", "linker_trace_action_exit=", "linker_trace_output_redirect_status=", "replay_findings=",
         "unreviewed_action_environment_key_names=",
         "CppLink_linker_candidate_path=", "linker_driver_helper=",
         "compiler_resolution_status=", "effective_sysroot_status=", "linker_resolution_status=",

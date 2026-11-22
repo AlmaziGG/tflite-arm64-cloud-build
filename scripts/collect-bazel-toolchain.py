@@ -121,6 +121,51 @@ def decide_effective_sysroot(explicit_paths, environment_hints, environment_capt
     return default_sysroot, "RESOLVED", "compiler default/configuration under captured no-override action environment"
 
 
+def compare_tf2_probes(driver, argv, env, cwd, default, probe=run):
+    """Only called for a direct pinned ARM GCC with one unreviewed key."""
+    if env.get("TF2_BEHAVIOR") != "1" or not default:
+        return False
+    without = env.copy()
+    del without["TF2_BEHAVIOR"]
+    for args in (["-dumpfullversion"], ["-dumpmachine"], ["-dumpspecs"],
+                 [*argv[1:], "-print-sysroot"], [*argv[1:], "-###"]):
+        pair = [probe([str(driver), *args], cwd=cwd, env=e) for e in (env, without)]
+        if any(p.returncode or not p.stdout.strip() for p in pair):
+            return False
+        a, b = (p.stdout.strip() for p in pair)
+        if args[-1] == "-###":
+            # GCC generates a fresh name for each temporary assembler or LTO file.
+            pattern = r"/tmp/cc[A-Za-z0-9]{6}(?=[.][\w.]+(?:\s|\"|$))"
+            a, b = (re.sub(pattern, "/tmp/<gcc-temp>", x) for x in (a, b))
+            if not re.search(r"(?:/cc1(?:plus)?|/collect2)(?:\"|\s)", a):
+                return False
+        if a != b:
+            return False
+        expected = {"-dumpfullversion": "11.3.1", "-dumpmachine": "aarch64-none-linux-gnu",
+                    "-print-sysroot": default}
+        if args[-1] in expected and a != expected[args[-1]]:
+            return False
+    return True
+
+
+def replay_findings(argv, cwd, diagnostic):
+    outputs = {i + 1 for i, arg in enumerate(argv[:-1]) if arg == "-o"}
+    inputs = [arg for i, arg in enumerate(argv) if i not in outputs and
+              not arg.startswith("-") and arg.endswith((".o", ".lo", ".a", ".so"))]
+    missing = [arg for arg in inputs if not (cwd / arg).is_file()]
+    findings = []
+    for signature, label in (("multiple definition of", "duplicate-definitions"),
+                             ("cannot find", "missing-link-input"), ("No such file", "missing-file"),
+                             ("undefined reference", "undefined-reference"),
+                             ("cannot open output", "output-open-error")):
+        if signature in diagnostic:
+            findings.append(label)
+    if any("fastbuild/" in arg and arg in diagnostic for arg in missing):
+        findings.append("missing-fastbuild-input-named-by-linker")
+    return (f"inputs={len(inputs)},missing={len(missing)},duplicate_inputs={len(inputs)-len(set(inputs))},"
+            f"output_options={len(outputs)},errors={'+'.join(findings) or 'none-classified'}")
+
+
 def redirect_link_output(argv, output_path):
     """Copy link argv while redirecting recognized output files into the probe dir."""
     result = list(argv)
@@ -506,8 +551,10 @@ def trace_linker_execution(launcher, argv, env, cwd, private_dir, target_name, *
         return {"selected": None, "reason": f"private execve trace could not be read ({type(exc).__name__})",
                 "trace_path": str(trace_path), "action_exit": result.returncode,
                 "output_redirect_status": output_status}
+    (probe_dir / "driver.private.log").write_text(result.stdout, encoding="utf-8")
     selection = resolve_linker_from_execve_trace(trace_text, cwd)
     return {**selection, "trace_path": str(trace_path), "action_exit": result.returncode,
+            "findings": replay_findings(argv, cwd, result.stdout),
             "output_redirect_status": output_status}
 
 
@@ -1008,6 +1055,14 @@ def main(argv):
                     - (RELEVANT_ENVIRONMENT | {"LANG", "LC_ALL", "HOME", "TMPDIR", "TMP", "TEMP", "PWD", "LD_LIBRARY_PATH", "LD_PRELOAD", "SOURCE_DATE_EPOCH"})
                 )
                 print(f"  unreviewed_action_environment_key_names={','.join(unreviewed_environment_keys) if unreviewed_environment_keys else '<none>'}", file=stream)
+                tf2_verified = (unreviewed_environment_keys == ["TF2_BEHAVIOR"] and
+                                not is_wrapper and environment_is_captured and not unresolved_response_files and
+                                launcher.name == "aarch64-none-linux-gnu-gcc" and
+                                "aarch64_linux_toolchain" in toolchain_roots and
+                                launcher.is_relative_to(toolchain_roots["aarch64_linux_toolchain"]) and
+                                compare_tf2_probes(launcher, expanded_argv, child_env, execution_root, default_sysroot))
+                if tf2_verified:
+                    unreviewed_environment_keys = []
                 effective_value, effective_status, sysroot_provenance = decide_effective_sysroot(
                     extract_sysroot_paths(expanded_argv),
                     env_sysroot_values,
@@ -1017,6 +1072,8 @@ def main(argv):
                     default_sysroot if default_sysroot_result == 0 else None,
                     unknown_environment_keys=unreviewed_environment_keys,
                 )
+                if tf2_verified and effective_status == "RESOLVED":
+                    sysroot_provenance += "; matched GCC version, triple, specs, action -print-sysroot and -### with/without TF2_BEHAVIOR"
                 effective_identity, effective_normalization = normalize_sysroot_identity(
                     effective_value,
                     {"aarch64_linux_toolchain": toolchain_roots["aarch64_linux_toolchain"]}
@@ -1083,6 +1140,8 @@ def main(argv):
                         environment_captured=environment_is_captured)
                     print(f"  linker_trace_status={'RESOLVED' if trace_result['selected'] else 'NOT RESOLVED'}", file=stream)
                     print(f"  linker_trace_action_exit={trace_result.get('action_exit')}", file=stream)
+                    if "findings" in trace_result:
+                        print(f"  replay_findings={trace_result['findings']}", file=stream)
                     print(f"  linker_trace_output_redirect_status={trace_result['output_redirect_status']}", file=stream)
                     if trace_result.get("trace_path"):
                         print(f"  linker_trace_private_file={trace_result['trace_path']}", file=stream)
