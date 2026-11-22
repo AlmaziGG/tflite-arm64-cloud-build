@@ -51,8 +51,8 @@ def check_production(path):
                 raise ValueError(f"{path.name}: missing or unresolved {kind} {field}")
 
 
-def verify_zip(data, digest, directory, *, structure=STRUCTURE, validate_structure=None):
-    reports = (structure, *TOOLCHAINS)
+def verify_zip(data, digest, directory, *, structure=STRUCTURE, validate_structure=None, extra_files=()):
+    reports = (structure, *TOOLCHAINS, *extra_files)
     members = {*reports, "SHA256SUMS"}
     if digest != "sha256:" + hashlib.sha256(data).hexdigest():
         raise ValueError("published ZIP digest mismatch")
@@ -65,10 +65,10 @@ def verify_zip(data, digest, directory, *, structure=STRUCTURE, validate_structu
                 raise ValueError("empty, oversized or non-regular ZIP member")
             (directory / item.filename).write_bytes(archive.read(item))
     manifest = (directory / "SHA256SUMS").read_bytes()
-    rows = re.findall(rb"^[0-9a-f]{64}  ([a-z0-9.-]+)\n", manifest, re.M)
-    if (not re.fullmatch(rb"(?:[0-9a-f]{64}  [a-z0-9.-]+\n){3}", manifest)
+    rows = re.findall(rb"^[0-9a-f]{64}  ([a-z0-9._-]+)\n", manifest, re.M)
+    if (not re.fullmatch(rb"(?:[0-9a-f]{64}  [a-z0-9._-]+\n)+", manifest)
             or sorted(name.decode("ascii") for name in rows) != sorted(reports)):
-        raise ValueError("invalid three-file manifest")
+        raise ValueError("invalid artifact manifest")
     subprocess.run(["sha256sum", "--check", "--strict", "SHA256SUMS"], cwd=directory, check=True)
     for name in TOOLCHAINS:
         check_sanitized(directory / name)

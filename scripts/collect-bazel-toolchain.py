@@ -121,7 +121,7 @@ def decide_effective_sysroot(explicit_paths, environment_hints, environment_capt
     return default_sysroot, "RESOLVED", "compiler default/configuration under captured no-override action environment"
 
 
-def compare_tf2_probes(driver, argv, env, cwd, default, probe=run):
+def compare_tf2_probes(driver, argv, env, cwd, default, probe=run, *, gcc_version="11.3.1"):
     """Only called for a direct pinned ARM GCC with one unreviewed key."""
     if env.get("TF2_BEHAVIOR") != "1" or not default:
         return False
@@ -141,7 +141,7 @@ def compare_tf2_probes(driver, argv, env, cwd, default, probe=run):
                 return False
         if a != b:
             return False
-        expected = {"-dumpfullversion": "11.3.1", "-dumpmachine": "aarch64-none-linux-gnu",
+        expected = {"-dumpfullversion": gcc_version, "-dumpmachine": "aarch64-none-linux-gnu",
                     "-print-sysroot": default}
         if args[-1] in expected and a != expected[args[-1]]:
             return False
@@ -1073,7 +1073,8 @@ def main(argv):
                                 launcher.name == "aarch64-none-linux-gnu-gcc" and
                                 "aarch64_linux_toolchain" in toolchain_roots and
                                 launcher.is_relative_to(toolchain_roots["aarch64_linux_toolchain"]) and
-                                compare_tf2_probes(launcher, expanded_argv, child_env, execution_root, default_sysroot))
+                                compare_tf2_probes(launcher, expanded_argv, child_env, execution_root, default_sysroot,
+                                                   gcc_version="10.3.1" if os.environ.get("CAPSULE_ARMGNU103") == "1" else "11.3.1"))
                 if tf2_verified:
                     unreviewed_environment_keys = []
                 effective_value, effective_status, sysroot_provenance = decide_effective_sysroot(

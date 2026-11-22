@@ -1,0 +1,137 @@
+name: Phase 2B ARM GNU 10.3 compatibility
+on:
+  push:
+    branches: [codex/phase2b-armgnu103-compatibility-20261122]
+permissions:
+  contents: read
+
+jobs:
+  build_and_validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CAPSULE_ARMGNU103: '1'
+    outputs:
+      artifact_id: ${{ steps.publish.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Preflight and regressions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git diff --check 7d36350a6bf72091d8e2d6d96f1d775106c2f1fc HEAD
+          test ! -e work && test ! -e artifacts
+          python3 -m py_compile scripts/*.py
+          for s in scripts/*.sh; do bash -n "$s"; done
+          ruby -rpsych -e 'Psych.parse_file(ARGV.fetch(0))' .github/workflows/phase2b-abi-compatible.yml
+          bash scripts/preflight.sh
+          python3 scripts/test_phase2b.py
+      - name: Prepare both firmware roots
+        id: ota
+        run: bash scripts/prepare-capsule-rootfs.sh > "$RUNNER_TEMP/p2b-ota" 2>&1
+      - name: Verify checksum, compiler, loader, headers and runtime
+        id: sdk
+        run: bash scripts/prepare-armgnu103.sh
+      - name: Clean TFLite library build
+        id: library
+        run: |
+          bash scripts/build-tflite.sh > "$RUNNER_TEMP/p2b-library" 2>&1
+          cmp work/tensorflow/bazel-bin/tensorflow/lite/c/libtensorflowlite_c.so artifacts/libtensorflowlite_c.so
+      - name: Clean smoke build
+        id: smoke
+        run: |
+          bash scripts/prepare-smoke-test.sh > "$RUNNER_TEMP/p2b-smoke" 2>&1
+          cmp work/tensorflow/bazel-bin/tensorflow/lite/c/cloud_smoke/tflite_smoke artifacts/tflite_smoke
+      - name: Strict library audits against both firmware roots
+        id: libabi
+        run: bash scripts/verify-abi.sh > "$RUNNER_TEMP/p2b-libabi" 2>&1
+      - name: Strict smoke audits against both firmware roots
+        id: exeabi
+        if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
+        run: bash scripts/verify-smoke-abi.sh > "$RUNNER_TEMP/p2b-exeabi" 2>&1
+      - name: Verify actual actions, inputs and independent ABI results
+        id: diagnostics
+        if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p -m 700 work/private-diagnostics
+          python3 scripts/phase2-evidence.py strict
+          bash scripts/collect-diagnostics.sh > "$RUNNER_TEMP/p2b-diagnostics" 2>&1
+          python3 scripts/verify-public-artifact.py check-sanitized
+          python3 scripts/verify-public-artifact.py production-gate
+          python3 scripts/phase2-evidence.py collect
+          python3 scripts/phase2b.py report
+      - name: QEMU invoke and guest loader verification on both roots
+        id: qemu
+        if: success() && steps.libabi.outcome == 'success' && steps.exeabi.outcome == 'success' && steps.diagnostics.outcome == 'success'
+        run: |
+          python3 scripts/phase2b.py matrix
+          bash scripts/run-smoke-test.sh > "$RUNNER_TEMP/p2b-qemu" 2>&1
+          python3 scripts/phase2b.py guest
+      - name: Validate accepted binaries and manifest
+        run: |
+          python3 scripts/phase2b.py safe
+          cd artifacts
+          sha256sum phase2-evidence.json compatibility.json libtensorflowlite_c.so tflite_smoke toolchain-{library,smoke}-sanitized.txt > SHA256SUMS
+          sha256sum --strict --check SHA256SUMS
+      - id: publish
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: phase2b-bazel-gnu103
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            artifacts/phase2-evidence.json
+            artifacts/compatibility.json
+            artifacts/libtensorflowlite_c.so
+            artifacts/tflite_smoke
+            artifacts/toolchain-library-sanitized.txt
+            artifacts/toolchain-smoke-sanitized.txt
+            artifacts/SHA256SUMS
+      - name: Record failed stages
+        if: failure()
+        env:
+          SDK: ${{ steps.sdk.outcome }}
+          LIBRARY: ${{ steps.library.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+          LIB_ABI: ${{ steps.libabi.outcome }}
+          EXE_ABI: ${{ steps.exeabi.outcome }}
+          DIAGNOSTICS: ${{ steps.diagnostics.outcome }}
+          QEMU: ${{ steps.qemu.outcome }}
+        shell: bash
+        run: |
+          python3 scripts/phase2b-failure.py | tee phase2b-status.txt
+      - name: Preserve failure evidence
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: phase2b-failure
+          path: phase2b-status.txt
+          if-no-files-found: error
+      - name: Clean private runner files
+        if: always()
+        run: |
+          test "$PWD" = "$GITHUB_WORKSPACE"
+          rm -rf -- work artifacts
+          rm -f -- "$RUNNER_TEMP"/p2b-*
+
+  verify_artifact:
+    needs: build_and_validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - name: Download accepted binaries and verify every digest
+        env:
+          ARTIFACT_ID: ${{ needs.build_and_validate.outputs.artifact_id }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/phase2b.py verify

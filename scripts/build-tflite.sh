@@ -13,6 +13,9 @@ git fetch --depth=1 origin "refs/tags/$TF_TAG:refs/tags/$TF_TAG"
 resolved="$(git rev-parse "$TF_TAG^{commit}")"
 [[ "$resolved" == "$TF_COMMIT" ]] || { echo "TensorFlow tag resolved to $resolved, expected $TF_COMMIT" >&2; exit 1; }
 git checkout --detach "$TF_COMMIT"
+if [[ "${CAPSULE_ARMGNU103:-0}" == 1 ]]; then
+  python3 "$ROOT/scripts/phase2b.py" configure "$PWD"
+fi
 raw_bazel_version="$(cat .bazelversion)"
 actual_bazel="$(printf '%s\n' "$raw_bazel_version" | awk '
   {
