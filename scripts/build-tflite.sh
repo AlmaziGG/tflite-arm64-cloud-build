@@ -37,7 +37,12 @@ curl --fail --location --retry 3 "https://github.com/bazelbuild/bazelisk/release
 [[ "$(sha256sum "$WORK/bazelisk-amd64.deb" | awk '{print $1}')" == "$BAZELISK_SHA256" ]] || { echo 'Bazelisk package SHA-256 mismatch.' >&2; exit 1; }
 dpkg-deb -x "$WORK/bazelisk-amd64.deb" "$WORK/bazelisk-package"
 install -m 0755 "$WORK/bazelisk-package/usr/bin/bazelisk" "$WORK/bin/bazelisk"
-USE_BAZEL_VERSION="$BAZEL_VERSION" "$WORK/bin/bazelisk" --output_user_root="$WORK/bazel-root" build \
+event_flags=()
+if [[ "${CAPSULE_ARMGNU103:-0}" == 1 ]]; then
+  mkdir -p -m 700 "$WORK/private-diagnostics"
+  event_flags=(--build_event_publish_all_actions "--build_event_json_file=$WORK/private-diagnostics/build-library.jsonl")
+fi
+USE_BAZEL_VERSION="$BAZEL_VERSION" "$WORK/bin/bazelisk" --output_user_root="$WORK/bazel-root" build "${event_flags[@]}" \
   --config=elinux_aarch64 -c opt --jobs=2 \
   --repository_cache="$WORK/repository-cache" \
   //tensorflow/lite/c:libtensorflowlite_c.so

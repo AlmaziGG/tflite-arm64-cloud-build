@@ -107,12 +107,15 @@ def check_inputs(inputs, expected, smoke):
 def compile_info(name, base):
     collector = load("collect-bazel-toolchain.py")
     graph, errors, _ = collector.parse_action_graph((p2.PRIVATE / f"actions-{name}.json").read_text())
+    analyzed = len(graph["CppCompile"])
+    graph["CppCompile"] = collector.executed_compiles(graph["CppCompile"], p2.PRIVATE / f"build-{name}.jsonl")
     links, _ = collector.select_actions(graph, name)
     checked(not errors and len(links) == 1, "invalid action graph")
     config = links[0]["configuration_id"]
     execroot = base / "execroot/org_tensorflow"
     checked((base / "external/aarch64_linux_toolchain").samefile(SDK), "different Bazel SDK")
-    counts = {"arm_compile": 0, "host_compile": 0, "root_link": 1}
+    counts = {"analyzed_compiles": analyzed, "executed_compiles": len(graph["CppCompile"]),
+              "arm_compile": 0, "host_compile": 0, "root_link": 1}
     system_dirs = set()
     flags = set()
     for action in [*links, *graph["CppCompile"]]:
@@ -177,8 +180,30 @@ def report():
     (p2.ART / "compatibility.json").write_text(json.dumps(result, indent=2) + "\n")
 
 
+def verify_guest_opens(trace, expected, root, artifacts):
+    """strace -yy resolves successful open results to physical host-visible fd paths."""
+    observed = set()
+    seen = set()
+    for raw in re.findall(r"(?m) = \d+<(/[^<>\n]+)>\s*$", trace):
+        path = Path(raw)
+        if path in seen or path.parts[1:2] in (("proc",), ("dev",), ("sys",)) or not path.is_file():
+            continue
+        seen.add(path)
+        with path.open("rb") as stream:
+            h = stream.read(20)
+        if h[:4] != b"\x7fELF" or h[4:6] != b"\x02\x01" or h[18:20] != b"\xb7\0":
+            continue
+        physical = path.resolve(strict=True)
+        checked(physical.is_relative_to(root) or physical in artifacts, "foreign AArch64 runtime in guest trace")
+        matches = {p for p in expected if p.samefile(physical)}
+        checked(matches and all(abi.digest(physical) == expected[p] for p in matches), "unapproved ARM ELF or guest hash mismatch")
+        observed.update(matches)
+    missing = {p.name for p in expected.keys() - observed}
+    checked(not missing, "missing verified guest opens " + ",".join(sorted(missing)))
+
+
 def guest():
-    """Trace the firmware loader's guest namespace; resolve each reported DSO against strict evidence."""
+    """Replay inference under strace and verify actual ARM64 files opened by QEMU."""
     matrix()
     fwdata = json.loads((p2.ART / p2.REPORT).read_text())["firmware"]
     compat = json.loads((p2.ART / "compatibility.json").read_text())
@@ -190,23 +215,20 @@ def guest():
         block = block.split(f"Capsule-{n} QEMU: PASS")[0]
         match = re.search(r"(input type=\d+ bytes=\d+ dims=[0-9x]+)\n(invoke=ok output type=\d+ bytes=\d+)\n(output\[0\]=[-0-9.e+]+)", block)
         checked(match and f"Capsule-{n} QEMU: PASS" in qlog, "missing successful inference")
-        trace = p2.output(["qemu-aarch64", "-L", root, "-U", "LD_PRELOAD", "-U", "LD_AUDIT", "-E",
-                           "LD_LIBRARY_PATH=" + str(p2.ART), "-E", "LD_TRACE_LOADED_OBJECTS=1", p2.TARGETS["smoke"]])
-        observed = {}
-        for name, resolved in re.findall(r"(?m)^\s*(\S+) => (\S+) \(0x[0-9a-f]+\)", trace):
-            if name == "libtensorflowlite_c.so":
-                path = Path(resolved)
-                checked(path.samefile(p2.TARGETS["library"]), "unexpected guest TFLite")
-            else:
-                path = abi.rootfs_resolve(root / resolved.lstrip("/"), root)
-                checked(path and path.is_file(), "unknown guest provider")
-            observed[name] = abi.digest(path)
-        for e in fw["audits"]["smoke"]["edges"]:
-            name = e["chain"][-1]
-            if name == Path(fw["loader"]).name:
-                checked(fw["loader"] in trace, "loader absent from trace")
-            else:
-                checked(observed.get(name) == e["sha256"], "guest runtime differs from strict evidence")
+        expected = {path: abi.digest(path) for path in p2.TARGETS.values()}
+        loader = abi.rootfs_resolve(root / fw["loader"].lstrip("/"), root)
+        expected[loader] = abi.digest(loader)
+        for edge in fw["audits"]["smoke"]["edges"]:
+            path = (p2.TARGETS["library"] if edge["provider"] == "artifacts/libtensorflowlite_c.so"
+                    else abi.rootfs_resolve(root / edge["provider"], root))
+            checked(path and path.is_file(), "strict guest provider missing before replay")
+            expected[path] = edge["sha256"]
+        trace = p2.PRIVATE / f"qemu-{n}.opens"
+        replay = p2.output(["strace", "-f", "-qq", "-yy", "-s", "4096", "-e", "trace=open,openat,openat2",
+                            "-o", trace, "qemu-aarch64", "-L", root, "-U", "LD_PRELOAD", "-U", "LD_AUDIT",
+                            "-E", "LD_LIBRARY_PATH=" + str(p2.ART), p2.TARGETS["smoke"], p2.WORK / "smoke-model.tflite"])
+        checked(all(line in replay.splitlines() for line in match.groups()), "inconsistent traced guest inference")
+        verify_guest_opens(trace.read_text(), expected, root, set(p2.TARGETS.values()))
         results[n] = list(match.groups())
     compat["inference"] = results
     (p2.ART / "compatibility.json").write_text(json.dumps(compat, indent=2) + "\n")

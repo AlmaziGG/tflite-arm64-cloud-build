@@ -181,6 +181,14 @@ def compare_tf2_probes(driver, argv, env, cwd, default, probe=None, *, gcc_versi
                     if evidence is not None:
                         evidence.append("-### pinned-assembler")
                 else:
+                    if evidence is not None:
+                        for kind, expression in (("missing-file", "No such file"), ("bad-flag", "unrecognized|invalid|unknown"),
+                                                 ("unused-input", "input file unused"), ("fatal", "fatal error:")):
+                            if re.search(expression, a, re.I):
+                                evidence.append(f"-### {kind}")
+                        if "-c" in argv and argv.index("-c") + 1 < len(argv):
+                            source = Path(cwd) / argv[argv.index("-c") + 1]
+                            evidence.append("-### " + ("source-present" if source.is_file() else "source-missing"))
                     return reject("-###", "no-recognized-backend")
         if a != b:
             return reject(args[-1], "different")
@@ -838,6 +846,28 @@ def action_signature(action):
     return (action["configuration_id"], args[0], tuple(relevant), digest)
 
 
+def executed_compiles(graph, event_path):
+    """Join successful BEP compile events to aquery by their full command line."""
+    by_command = {tuple(a["argv"]): a for a in graph}
+    selected = {}
+    finished = False
+    with event_path.open() as stream:
+        for line in stream:
+            event = json.loads(line)
+            if "finished" in event:
+                finished = event["finished"].get("exitCode", {}).get("name") == "SUCCESS"
+            action = event.get("action", {})
+            if action.get("type") != "CppCompile":
+                continue
+            command = tuple(action.get("commandLine", []))
+            if not action.get("success") or not command or command not in by_command:
+                raise ValueError("executed compile failed or has no exact aquery command")
+            selected[command] = by_command[command]
+    if not finished or not selected or len(by_command) != len(graph):
+        raise ValueError("incomplete execution evidence or ambiguous aquery compile commands")
+    return list(selected.values())
+
+
 def select_actions(actions, target_name):
     root_label = ROOT_LINK_LABELS[target_name]
     links = [item for item in actions["CppLink"] if item["target"] == root_label]
@@ -915,6 +945,10 @@ def main(argv):
             print(f"json_action_graph_error={error}", file=stream)
             mark_failure("jsonproto-structure", error)
             return_code = 1
+        if os.environ.get("CAPSULE_ARMGNU103") == "1":
+            analyzed = len(actions["CppCompile"])
+            actions["CppCompile"] = executed_compiles(actions["CppCompile"], actions_file.parent / f"build-{target_name}.jsonl")
+            print(f"compile_execution_counts analyzed={analyzed} executed={len(actions['CppCompile'])}", file=stream)
         root_links, compile_groups = select_actions(actions, target_name)
         compile_total = len(actions["CppCompile"])
         print(f"target_name={target_name}", file=stream)

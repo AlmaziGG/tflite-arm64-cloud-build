@@ -132,6 +132,45 @@ class CompatibilityTests(unittest.TestCase):
                                     text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
 
+    def test_build_events_require_complete_exact_execution_evidence(self):
+        import json
+        collector = build.load("collect-bazel-toolchain.py")
+        graph = [{"argv": ["gcc", "-c", src]} for src in ("used.c", "analysis-only.c")]
+        event = {"action": {"type": "CppCompile", "success": True, "commandLine": graph[0]["argv"]}}
+        end = {"finished": {"exitCode": {"name": "SUCCESS"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "events"
+            def check(records):
+                f.write_text("\n".join(json.dumps(row) for row in records))
+                return collector.executed_compiles(graph, f)
+            self.assertEqual(check([event, end]), graph[:1])
+            for records in ([event], [end], [{"action": dict(event["action"], commandLine=["gcc", "-c", "other.c"])}, end]):
+                with self.assertRaises(ValueError):
+                    check(records)
+
+    def test_guest_opens_require_guest_path_and_all_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "guest"
+            root.mkdir()
+            headers = b"\x7fELF\x02\x01" + bytes(12) + b"\xb7\0"
+            lib = root / "libc-2.33.so"
+            lib.write_bytes(headers)
+            exe = Path(tmp) / "smoke"
+            exe.write_bytes(headers + b"smoke")
+            foreign = Path(tmp) / "other"
+            foreign.write_bytes(headers)
+            expected = {p: build.abi.digest(p) for p in (lib, exe)}
+            def check(paths):
+                log = "\n".join(f'123 openat(AT_FDCWD, "name", O_RDONLY) = 3<{p}>' for p in paths)
+                build.verify_guest_opens(log, expected, root, {exe})
+            check([exe, lib])
+            for paths in ([exe], [exe, foreign], [exe, lib, foreign]):
+                with self.assertRaises(ValueError):
+                    check(paths)
+            lib.write_bytes(headers + b"changed")
+            with self.assertRaises(ValueError):
+                check([exe, lib])
+
 
 if __name__ == "__main__":
     unittest.main()

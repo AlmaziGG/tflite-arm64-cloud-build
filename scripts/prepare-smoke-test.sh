@@ -52,7 +52,12 @@ cc_binary(
 )
 BUILD
 cd "$tf"
-USE_BAZEL_VERSION="$BAZEL_VERSION" "$WORK/bin/bazelisk" --output_user_root="$WORK/bazel-root" build \
+event_flags=()
+if [[ "${CAPSULE_ARMGNU103:-0}" == 1 ]]; then
+  mkdir -p -m 700 "$WORK/private-diagnostics"
+  event_flags=(--build_event_publish_all_actions "--build_event_json_file=$WORK/private-diagnostics/build-smoke.jsonl")
+fi
+USE_BAZEL_VERSION="$BAZEL_VERSION" "$WORK/bin/bazelisk" --output_user_root="$WORK/bazel-root" build "${event_flags[@]}" \
   --config=elinux_aarch64 -c opt --jobs=2 \
   //tensorflow/lite/c/cloud_smoke:tflite_smoke
 smoke='bazel-bin/tensorflow/lite/c/cloud_smoke/tflite_smoke'

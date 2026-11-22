@@ -1,6 +1,7 @@
 """Publish stage outcomes and allowlisted diagnostic evidence, never command lines."""
 import os
 import re
+import json
 from pathlib import Path
 
 for key in ("SDK", "LIBRARY", "SMOKE", "LIB_ABI", "EXE_ABI", "DIAGNOSTICS", "QEMU"):
@@ -43,7 +44,13 @@ for target in ("library", "smoke"):
     private = Path(f"work/private-diagnostics/toolchain-{target}.txt")
     if private.is_file():
         for line in private.read_text().splitlines():
-            if re.fullmatch(r"tf2_comparison=[-#a-z]+ (different|unsuccessful|unexpected|foreign-root|different-stderr|equal-stderr|same-directory|pinned-assembler|no-recognized-backend)", line):
+            if re.fullmatch(r"compile_execution_counts analyzed=\d+ executed=\d+", line):
+                print(target, line)
+            for cause in ("executed compile failed or has no exact aquery command",
+                          "incomplete execution evidence or ambiguous aquery compile commands"):
+                if cause in line:
+                    print(target, cause)
+            if re.fullmatch(r"tf2_comparison=[-#a-z]+ (different|unsuccessful|unexpected|foreign-root|different-stderr|equal-stderr|same-directory|pinned-assembler|no-recognized-backend|missing-file|bad-flag|unused-input|fatal|source-present|source-missing)", line):
                 print(target, line)
             match = re.match(r"ERROR \[([\w-]+)\]|collector_failure_category=([\w-]+)", line)
             if match:
@@ -70,3 +77,11 @@ if qemu.is_file():
     for line in qemu.read_text(errors="replace").splitlines():
         if re.fullmatch(r"Capsule-(14|15) QEMU: (PASS|FAIL \(exit=\d+\))|invoke=ok output type=\d+ bytes=\d+|output\[0\]=[-0-9.e+]+", line):
             print(line)
+
+evidence = Path("artifacts/phase2-evidence.json")
+if evidence.is_file():
+    for name, elf in json.loads(evidence.read_text())["binaries"].items():
+        if name in ("library", "smoke") and re.fullmatch(r"[a-f0-9]{64}", elf["sha256"]):
+            print(name, int(elf["bytes"]), elf["sha256"])
+            for versions in elf["version_needs"].values():
+                print(name, *[s for s in versions if re.fullmatch(r"(?:GLIBCXX|GLIBC|CXXABI|GCC)_[\d.]+", s)])
