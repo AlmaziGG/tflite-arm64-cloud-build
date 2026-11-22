@@ -415,6 +415,7 @@ class IntegrationAndSecurityTests(unittest.TestCase):
         self.assertIn("artifacts/toolchain-library-sanitized.txt", workflow)
         self.assertIn("artifacts/toolchain-smoke-sanitized.txt", workflow)
         self.assertIn("artifacts/SHA256SUMS", workflow)
+        self.assertIn("artifact-ids: ${{ steps.upload_public_artifact.outputs.artifact-id }}", workflow)
         self.assertIn("bash ./scripts/prepare-capsule-rootfs.sh", workflow)
         self.assertNotIn("actions-library.json", workflow)
         self.assertNotIn("actions-smoke.json", workflow)
