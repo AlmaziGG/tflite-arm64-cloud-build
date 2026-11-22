@@ -277,6 +277,24 @@ response_file_contents=private data
         for secret in ("/home/runner/", "ACTION_SECRET", "raw_json", "raw_command", "ghp_", "Bearer", "response_file_contents", "private data", "action_env[PATH]"):
             self.assertNotIn(secret, public)
 
+    def test_sanitizer_redacts_runner_paths_after_colon_in_search_dirs(self):
+        private = """=== Actual compiler metadata (wrapper paths excluded) ===
+$ /private/toolchain/bin/aarch64-gcc -print-search-dirs
+install: /usr/lib/gcc-cross/aarch64-linux-gnu/11/
+programs: =/usr/lib/gcc-cross/aarch64-linux-gnu/11/:/home/runner/work/private/gcc/bin
+libraries: =/usr/lib/aarch64-linux-gnu:/home/runner/work/private/sysroot/lib
+(exit=0)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination = Path(directory) / "private.txt", Path(directory) / "public.txt"
+            source.write_text(private, encoding="utf-8")
+            sanitizer.sanitize(source, destination)
+            public = destination.read_text(encoding="utf-8")
+        self.assertIn("compiler_programs:", public)
+        self.assertIn("compiler_libraries:", public)
+        self.assertNotIn("/home/runner/", public)
+        self.assertNotIn("/private/toolchain/", public)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,10 @@ TOKEN_PATTERNS = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"(?i)https?://[^/\s:@]+:[^/@\s]+@"),
 )
-POSIX_PATH = re.compile(r"(?<![A-Za-z0-9:/])/(?!/)(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+")
+# GCC's -print-search-dirs output is colon-delimited. A path following a colon
+# is still a path (and may be under /home/runner), so do not treat ':' as a
+# safe left boundary. The double-slash guard keeps URL schemes from matching.
+POSIX_PATH = re.compile(r"(?<![A-Za-z0-9/])/(?!/)(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+")
 WINDOWS_PATH = re.compile(r"(?i)\b[A-Z]:\\(?:[^\s,;]+\\?)*")
 
 
