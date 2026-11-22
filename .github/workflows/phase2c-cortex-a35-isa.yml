@@ -1,0 +1,77 @@
+name: Phase 2C Cortex A35 ISA
+on:
+  push:
+    branches: [codex/phase2c-cortex-a35-isa-validation-20261122]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  analyze_and_test:
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - name: Syntax and regressions
+        run: |
+          git diff --check
+          python3 -m py_compile scripts/*.py
+          for s in scripts/*.sh; do bash -n "$s"; done
+          ruby -rpsych -e 'Psych.parse_file(ARGV.fetch(0))' .github/workflows/phase2c-cortex-a35-isa.yml
+          bash scripts/preflight.sh
+          python3 scripts/test_phase2b.py
+          python3 scripts/test_phase2c.py
+      - name: Resolve immutable reference ZIP
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p artifacts
+          python3 scripts/phase2c.py baseline
+          chmod 755 artifacts/tflite_smoke
+      - name: Prepare pinned SDK and root filesystems
+        run: |
+          bash scripts/prepare-armgnu103.sh
+          bash scripts/prepare-capsule-rootfs.sh > "$RUNNER_TEMP/ota-log" 2>&1
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-user
+      - name: Compile auxiliary probe
+        run: |
+          source scripts/common.sh
+          curl -fsSL "$MODEL_URL" -o work/model
+          require_sha256 work/model "$MODEL_SHA256"
+          for h in c/c_api.h core/c/c_api.h builtin_ops.h core/async/c/types.h core/c/c_api_types.h core/c/operator.h; do
+            dest="work/include/tensorflow/lite/$h"
+            mkdir -p "$(dirname "$dest")"
+            curl -fsSL --retry 3 "https://raw.githubusercontent.com/tensorflow/tensorflow/$TF_COMMIT/tensorflow/lite/$h" -o "$dest"
+          done
+          strace -f -e execve -o work/compiler.trace work/armgnu103/bin/aarch64-none-linux-gnu-gcc -march=armv8-a -O2 -Iwork/include scripts/phase2c-probe.c -Lartifacts -ltensorflowlite_c -ldl -Wl,-t -o work/probe > work/link.inputs
+          grep -Eq 'execve\("[^"]*/ld[^"]*".*= 0$' work/compiler.trace
+      - id: measure
+        run: python3 scripts/phase2c.py validation
+      - if: ${{ !cancelled() && steps.measure.outcome != 'skipped' }}
+        run: cd public && sha256sum isa.json > SHA256SUMS
+      - id: upload
+        if: ${{ !cancelled() && hashFiles('public/SHA256SUMS') != '' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: phase2c-evidence
+          path: |
+            public/isa.json
+            public/SHA256SUMS
+          if-no-files-found: error
+  verify_artifact:
+    needs: analyze_and_test
+    if: ${{ !cancelled() && needs.analyze_and_test.outputs.artifact != '' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          ARTIFACT_ID: ${{ needs.analyze_and_test.outputs.artifact }}
+        run: python3 scripts/phase2c.py verify
