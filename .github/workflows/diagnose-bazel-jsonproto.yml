@@ -1,0 +1,100 @@
+name: Diagnose Bazel 6.5.0 JSONPROTO
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bazel-jsonproto-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Create private temporary diagnostics directory
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          private_dir="$(mktemp -d "${RUNNER_TEMP}/bazel-jsonproto-private.XXXXXXXX")"
+          chmod 700 "$private_dir"
+          printf 'JSONPROTO_PRIVATE_DIR=%s\n' "$private_dir" >> "$GITHUB_ENV"
+
+      - name: Check inspector Python syntax
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/jsonproto-python-cache
+        run: python3 -m py_compile ./scripts/inspect-bazel-jsonproto.py
+
+      - name: Preflight runner and existing regression tests
+        run: bash ./scripts/preflight.sh
+
+      - name: Build TensorFlow Lite library with pinned toolchain
+        run: bash ./scripts/build-tflite.sh
+
+      - name: Build smoke target and prepare its generated BUILD file
+        run: bash ./scripts/prepare-smoke-test.sh
+
+      - name: Collect JSONPROTO matrix and write structural report
+        id: jsonproto
+        shell: bash
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/jsonproto-python-cache
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          source ./scripts/common.sh
+          python3 ./scripts/inspect-bazel-jsonproto.py \
+            --tensorflow "$WORK/tensorflow" \
+            --bazel "$WORK/bin/bazelisk" \
+            --output-user-root "$WORK/bazel-root" \
+            --private-dir "$JSONPROTO_PRIVATE_DIR" \
+            --report "$ARTIFACTS/bazel-jsonproto-structure-report.txt"
+
+      - name: Validate report safety and add it to the job summary
+        id: report_safety
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 ./scripts/inspect-bazel-jsonproto.py \
+            --validate-report ./artifacts/bazel-jsonproto-structure-report.txt
+          cat ./artifacts/bazel-jsonproto-structure-report.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the single validated structural report
+        if: always() && steps.report_safety.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bazel-jsonproto-structure-report
+          path: artifacts/bazel-jsonproto-structure-report.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove private JSONPROTO diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          if [[ -z "${JSONPROTO_PRIVATE_DIR:-}" ]]; then
+            echo 'Private diagnostics directory was not created.'
+            exit 0
+          fi
+          case "$JSONPROTO_PRIVATE_DIR" in
+            "$RUNNER_TEMP"/bazel-jsonproto-private.*)
+              rm -rf -- "$JSONPROTO_PRIVATE_DIR"
+              echo 'Removed the temporary private diagnostics directory.'
+              ;;
+            *)
+              echo 'Refusing cleanup outside the expected RUNNER_TEMP prefix.' >&2
+              exit 1
+              ;;
+          esac
