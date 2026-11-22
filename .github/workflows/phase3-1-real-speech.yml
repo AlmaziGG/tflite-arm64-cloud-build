@@ -1,0 +1,95 @@
+name: Phase 3.1 speech validation
+on:
+  push:
+    branches: [codex/phase3-1-real-speech-validation-20261123]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  validate_and_measure:
+    environment: phase31-consented-audio-20261123
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check base and regressions
+        run: |
+          git merge-base --is-ancestor d77444bf4364446b4b3d9cb725a3bba5523d020c HEAD
+          git diff --check d77444bf4364446b4b3d9cb725a3bba5523d020c HEAD
+          python3 -m py_compile scripts/*.py
+          for s in scripts/*.sh; do bash -n "$s"; done
+          ruby -rpsych -e 'Psych.parse_file(ARGV.fetch(0))' .github/workflows/phase3-1-real-speech.yml
+          bash scripts/preflight.sh
+          python3 scripts/test_phase2b.py
+          python3 scripts/test_phase2c.py
+          python3 scripts/test_phase2d.py
+          python3 scripts/test_speech31.py
+      - name: Verify immutable Phase 2B artifact
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -c 'from sys import path; path.insert(0,"scripts"); import phase2c; phase2c.art.mkdir(exist_ok=True); phase2c.baseline()'
+      - name: Verify SDK and prepare native and cross builds
+        run: |
+          bash scripts/prepare-armgnu103.sh
+          bash scripts/phase3-build.sh
+          python3 scripts/test_phase3.py
+          python3 -c 'from sys import path; path.insert(0,"scripts"); import speech31; speech31.identity()'
+      - name: Prepare both OTA userspaces
+        run: |
+          bash scripts/prepare-capsule-rootfs.sh > "$RUNNER_TEMP/ota-log" 2>&1
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-user
+      - name: Audit both OTAs then compare emulated inference
+        run: python3 scripts/phase3.py
+      - name: Exercise verification against tampered copies of measured evidence
+        run: python3 scripts/test_phase3.py ArtifactTests
+      - name: Fetch licensed source recordings into runner-private storage
+        run: python3 scripts/speech31.py prepare
+      - name: Receive optional owner-authorized control in private storage
+        env:
+          P31_0: ${{ secrets.P31_0 }}
+          P31_1: ${{ secrets.P31_1 }}
+          P31_2: ${{ secrets.P31_2 }}
+          P31_3: ${{ secrets.P31_3 }}
+          P31_4: ${{ secrets.P31_4 }}
+          P31_5: ${{ secrets.P31_5 }}
+          P31_6: ${{ secrets.P31_6 }}
+        run: python3 scripts/speech31.py receive
+      - name: Measure both firmware variants and validate public projections
+        run: |
+          umask 077
+          python3 scripts/speech31.py measure
+          python3 scripts/test_speech31.py MeasuredTests
+      - name: Discard private media and traces
+        if: always()
+        run: rm -rf -- work/phase31-private work/p3/trace.private
+      - id: upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: phase3-1-speech-evidence
+          if-no-files-found: error
+          path: |
+            public31/phase3-1-report.json
+            public31/speech-test-manifest.json
+            public31/speech-detection-summary.json
+            public31/speech-latency-summary.json
+            public31/speech-session-results.json
+            public31/SHA256SUMS
+  verify_artifact:
+    needs: validate_and_measure
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          ARTIFACT_ID: ${{ needs.validate_and_measure.outputs.artifact }}
+        run: python3 scripts/speech31.py verify
