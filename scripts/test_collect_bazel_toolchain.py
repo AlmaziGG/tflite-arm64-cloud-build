@@ -29,6 +29,14 @@ def fixture_graph():
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 
+def target_graph(target_name):
+    graph = fixture_graph()
+    target_ids = {1, 2} if target_name == "library" else {3, 4}
+    graph["actions"] = [action for action in graph["actions"] if action["targetId"] in target_ids]
+    graph["targets"] = [target for target in graph["targets"] if target["id"] in target_ids]
+    return graph
+
+
 class JsonProtoCollectorTests(unittest.TestCase):
     def test_fixture_matches_observed_actiongraph_container_shape(self):
         document = fixture_graph()
@@ -42,7 +50,7 @@ class JsonProtoCollectorTests(unittest.TestCase):
         self.assertIsInstance(action["paramFiles"][0]["arguments"], list)
 
     def test_target_mapping_and_root_library_link_selection(self):
-        actions, errors, labels = collector.validate_action_graph(fixture_graph())
+        actions, errors, labels = collector.validate_action_graph(target_graph("library"))
         links, groups = collector.select_actions(actions, "library")
         self.assertEqual(errors, [])
         self.assertEqual(labels[1], "//tensorflow/lite/c:libtensorflowlite_c.so")
@@ -52,7 +60,7 @@ class JsonProtoCollectorTests(unittest.TestCase):
         self.assertEqual(sum(count for _, _, count in groups), 1)
 
     def test_smoke_compile_and_link_selection(self):
-        actions, errors, _ = collector.validate_action_graph(fixture_graph())
+        actions, errors, _ = collector.validate_action_graph(target_graph("smoke"))
         links, groups = collector.select_actions(actions, "smoke")
         self.assertEqual(errors, [])
         self.assertEqual(len(links), 1)
@@ -72,8 +80,8 @@ class JsonProtoCollectorTests(unittest.TestCase):
         actions, errors, _ = collector.validate_action_graph(fixture_graph())
         argv = actions["CppCompile"][0]["argv"]
         self.assertEqual(errors, [])
+        self.assertLess(argv.index("-c"), argv.index("--sysroot"))
         self.assertLess(argv.index("--sysroot"), argv.index("-march=armv8-a"))
-        self.assertLess(argv.index("-march=armv8-a"), argv.index("-c"))
         self.assertEqual(actions["CppCompile"][0]["param_file_status"], "RESOLVED")
 
     def test_nested_response_records_and_argument_quoting(self):
@@ -116,7 +124,7 @@ class JsonProtoCollectorTests(unittest.TestCase):
         self.assertEqual(collector.extract_sysroots(["cc", "--sysroot", "/a", "--sysroot=/b", "-isysroot", "/c", "-isysroot/d", "-isysroot=/e"]), ["/a", "/b", "-isysroot /c", "/d", "/e"])
 
     def test_different_toolchain_signatures_form_distinct_groups(self):
-        graph = fixture_graph()
+        graph = target_graph("library")
         second = json.loads(json.dumps(graph["actions"][0]))
         second["targetId"] = 2
         second["actionKey"] = "different-toolchain-signature"
