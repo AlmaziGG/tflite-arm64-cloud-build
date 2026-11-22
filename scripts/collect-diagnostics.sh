@@ -120,7 +120,7 @@ for name in library smoke; do
     : > "$actions"
     : > "$action_stderr"
     if (cd "$tf" && USE_BAZEL_VERSION="$BAZEL_VERSION" "$bazel" \
-        --output_user_root="$WORK/bazel-root" aquery --config=elinux_aarch64 \
+        --output_user_root="$WORK/bazel-root" aquery --config=elinux_aarch64 -c opt --jobs=2 \
         --output=jsonproto --include_param_files "$expression") > "$actions" 2> "$action_stderr"; then
       if [[ -s "$actions" ]]; then
         printf 'STATUS: private JSONPROTO captured for %s (%s bytes); stderr retained privately.\n' "$name" "$(wc -c < "$actions")"

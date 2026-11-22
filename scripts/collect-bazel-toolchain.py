@@ -663,13 +663,25 @@ def validate_action_graph(document):
         if malformed_param:
             errors.append(f"action[{index}] has malformed or duplicate paramFiles records")
             continue
-        expanded, unresolved = expand_jsonproto_param_files(args, param_map)
+        execution_args = args
+        response_check = None
+        if mnemonic == "CppLink" and len(param_map) == 1:
+            # Bazel 6.5 LinkCommandLine.arguments() gives getRawLinkArgv().
+            # getCommandLine(expander) actually executes driver + @params.
+            # Accept this representation only on complete, ordered equality.
+            path, body = next(iter(param_map.items()))
+            refs = [arg for arg in args[1:] if arg.startswith("@")]
+            if refs == ["@" + path] and [arg for arg in args[1:] if arg != refs[0]] == body:
+                execution_args = [args[0], *refs]
+                response_check = (path, body)
+        expanded, unresolved = expand_jsonproto_param_files(execution_args, param_map)
         referenced = referenced_param_files(args, param_map)
         unreferenced = set(param_map) - referenced
         if unreferenced:
             unresolved.append("one or more paramFiles records are not referenced by action arguments")
         normalized[mnemonic].append({
             "argv": expanded,
+            "link_response_check": response_check,
             "target": label,
             "target_id": action_id,
             "configuration_id": configuration_id,
@@ -1056,6 +1068,7 @@ def main(argv):
                 )
                 print(f"  unreviewed_action_environment_key_names={','.join(unreviewed_environment_keys) if unreviewed_environment_keys else '<none>'}", file=stream)
                 tf2_verified = (unreviewed_environment_keys == ["TF2_BEHAVIOR"] and
+                                not any(child_env.get(k) for k in ("LD_LIBRARY_PATH", "LD_PRELOAD")) and
                                 not is_wrapper and environment_is_captured and not unresolved_response_files and
                                 launcher.name == "aarch64-none-linux-gnu-gcc" and
                                 "aarch64_linux_toolchain" in toolchain_roots and
@@ -1134,6 +1147,22 @@ def main(argv):
                     # does not execute the linker. Only the successful execve
                     # trace of this action-compatible replay resolves actual.
                     print(f"  dry_run_linker_selection_candidate={selection['selected'] or '<not proven by -###>'}", file=stream)
+                    response_check = action["link_response_check"]
+                    if response_check:
+                        response_path, expected = response_check
+                        disk_path = execution_root / response_path
+                        try:
+                            disk_args = shlex.split(disk_path.read_text(encoding="utf-8"))
+                        except (OSError, UnicodeError, ValueError):
+                            disk_args = None
+                        if disk_args != expected:
+                            mark_failure("response-files", "root link response disagrees with on-disk build input")
+                            print("  linker_resolution_status=NOT RESOLVED: built response file unavailable or changed", file=stream)
+                            continue
+                        print("  response_file_status=verified identical ordered arguments in JSONPROTO and build response file", file=stream)
+                    if unresolved_response_files:
+                        print("  linker_resolution_status=NOT RESOLVED: incomplete parameter file evidence", file=stream)
+                        continue
                     trace_result = trace_linker_execution(
                         launcher, expanded_argv, child_env, execution_root,
                         report.parent / "linker-exec-traces", f"{target_name}-{number}",

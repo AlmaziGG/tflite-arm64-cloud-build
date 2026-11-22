@@ -38,6 +38,18 @@ def target_graph(target_name):
 
 
 class JsonProtoCollectorTests(unittest.TestCase):
+    def test_link_raw_argv_mirrors_response_exactly_once(self):
+        graph = target_graph("library")
+        record = next(a for a in graph["actions"] if a["targetId"] == 1)
+        response = record["paramFiles"][0]
+        response["arguments"] = ["-o", "library", "a.o", "a.o"]
+        record["arguments"] = ["gcc", *response["arguments"], "@" + response["execPath"]]
+        acts, errors, _ = collector.validate_action_graph(graph)
+        self.assertFalse(errors)
+        link = collector.select_actions(acts, "library")[0][0]
+        self.assertEqual(link["argv"], ["gcc", "-o", "library", "a.o", "a.o"])
+        self.assertEqual(link["link_response_check"], (response["execPath"], response["arguments"]))
+
     def test_fixture_matches_observed_actiongraph_container_shape(self):
         document = fixture_graph()
         self.assertEqual(set(document), {"actions", "artifacts", "configuration", "depSetOfFiles", "pathFragments", "ruleClasses", "targets"})
