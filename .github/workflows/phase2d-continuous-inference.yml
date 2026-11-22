@@ -17,7 +17,7 @@ jobs:
           persist-credentials: false
       - name: Syntax and regressions
         run: |
-          git diff --check
+          git show --check --format= HEAD
           python3 -m py_compile scripts/*.py
           for s in scripts/*.sh; do bash -n "$s"; done
           ruby -rpsych -e 'Psych.parse_file(ARGV.fetch(0))' .github/workflows/phase2d-continuous-inference.yml
@@ -54,6 +54,8 @@ jobs:
           grep -Eq 'execve\("[^"]*/ld[^"]*".*= 0$' work/compiler.trace
       - id: measure
         run: python3 scripts/phase2d.py
+      - name: Replay negative acceptance tests against measured data
+        run: python3 scripts/test_phase2d.py
       - run: cd public && sha256sum phase2d-report.json > SHA256SUMS
       - id: upload
         if: ${{ !cancelled() && hashFiles('public/SHA256SUMS') != '' }}

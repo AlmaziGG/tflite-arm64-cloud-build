@@ -73,7 +73,7 @@ static void sequence(const char *label,TfLiteInterpreter *it) {
     puts("");
 }
 static void state(TfLiteModel *m,const char *path) {
-    const char *modes[]={"fresh","reset","allocate","recreate","newmodel"};
+    const char *modes[]={"persistent","reset","allocate","recreate","newmodel"};
     for(unsigned i=0;i<5;i++) {
         TfLiteInterpreter *it=create(m); allocate(it);
         sequence("initial",it);
@@ -97,7 +97,13 @@ int main(int argc,char **argv) {
     TfLiteModel *m=TfLiteModelCreateFromFile(argv[1]);
     require(m!=NULL,"model");
     printf("time model %"PRIu64"\n",now()-t);
-    if(!strcmp(argv[2],"state")) state(m,argv[1]);
+    if(!strcmp(argv[2],"badsize")) {
+        TfLiteInterpreter *it=create(m); allocate(it);
+        TfLiteTensor *in=TfLiteInterpreterGetInputTensor(it,0);
+        int8_t short_input[119]={0};
+        require(in && TfLiteTensorCopyFromBuffer(in,short_input,sizeof(short_input))!=kTfLiteOk,"badsize");
+        TfLiteInterpreterDelete(it);
+    } else if(!strcmp(argv[2],"state")) state(m,argv[1]);
     else if(!strcmp(argv[2],"stress")) {
         checkpoint("model",0); t=now();
         TfLiteInterpreter *it=create(m);
