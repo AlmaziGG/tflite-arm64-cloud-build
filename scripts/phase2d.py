@@ -247,6 +247,23 @@ def main():
             try: row[mode]=benchmark(root,mode)
             except Exception as e:
                 errors.append(n+" "+mode+" "+type(e).__name__)
+        if n=="14":
+            fault=ref.work/"fault-probe"
+            subprocess.run([sys.executable,"scripts/verify_elf_abi.py",fault,root,"--allow-library",ref.lib],check=True)
+            row["injected"]={}
+            for kind,reason in (("allocate","allocate"),("type","input"),("shape","input"),
+                                ("output","output"),("invoke","invoke"),("reset","reset"),
+                                ("teardown",-6),("crash",-6),("sigill",-4),("interrupt",-15),("timeout","timeout")):
+                try:
+                    proc=subprocess.run([*cmd[:-1],"-E","P2D_TEST_FAULT="+kind,fault,ref.work/"model","state"],
+                                        input="\n",capture_output=True,text=True,timeout=2 if kind=="timeout" else 20)
+                except subprocess.TimeoutExpired:
+                    check(kind=="timeout","unexpected timeout"); row["injected"][kind]="timeout"; continue
+                if isinstance(reason,int):
+                    check(proc.returncode in (reason,128-reason),"signal propagation")
+                else:
+                    check(proc.returncode==1 and "FAIL "+reason+" " in proc.stderr,"fault propagation")
+                row["injected"][kind]=proc.returncode
     check(not errors,str(errors))
     validate(doc); P.parent.mkdir(exist_ok=True); P.write_text(json.dumps(doc,sort_keys=True)+"\n")
 

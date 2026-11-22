@@ -14,10 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Syntax and regressions
         run: |
-          git show --check --format= HEAD
+          git diff --check bd3f90307febe5b3cf5223d68fae64e92f0d5bac HEAD
           python3 -m py_compile scripts/*.py
           for s in scripts/*.sh; do bash -n "$s"; done
           ruby -rpsych -e 'Psych.parse_file(ARGV.fetch(0))' .github/workflows/phase2d-continuous-inference.yml
@@ -52,8 +53,11 @@ jobs:
           done
           strace -f -e execve -o work/compiler.trace work/armgnu103/bin/aarch64-none-linux-gnu-gcc -march=armv8-a -O2 -Iwork/include scripts/phase2d-probe.c -Lartifacts -ltensorflowlite_c -ldl -Wl,-t -o work/probe > work/link.inputs
           grep -Eq 'execve\("[^"]*/ld[^"]*".*= 0$' work/compiler.trace
+          work/armgnu103/bin/aarch64-none-linux-gnu-gcc -march=armv8-a -O2 -Iwork/include scripts/phase2d-faults.c -Lartifacts -ltensorflowlite_c -o work/fault-probe
       - id: measure
-        run: python3 scripts/phase2d.py
+        run: |
+          ulimit -c 0
+          python3 scripts/phase2d.py
       - name: Replay negative acceptance tests against measured data
         run: python3 scripts/test_phase2d.py
       - run: cd public && sha256sum phase2d-report.json > SHA256SUMS
