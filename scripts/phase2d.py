@@ -104,6 +104,8 @@ def trend(points,stage):
 
 
 def benchmark(root,mode):
+    progress=ref.work/"completed-private"
+    if mode=="stress": progress.unlink(missing_ok=True)
     command=["qemu-aarch64","-cpu","cortex-a35","-L",root,"-U","LD_PRELOAD","-U","LD_AUDIT","-E",
              "LD_LIBRARY_PATH="+str(ref.art),ref.work/"probe",ref.work/"model",mode]
     p=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
@@ -114,7 +116,7 @@ def benchmark(root,mode):
             if line.startswith("caps="): result["caps"]=ref.caps(line)
             elif words[0]=="point":
                 _,stage,index,heap,mapped=words
-                points.append(dict(stage=stage,index=int(index),guest_heap=int(heap),guest_mmap=int(mapped),**snapshot(p.pid)))
+                points.append(dict(stage=stage,index=int(index),monotonic_ns=time.monotonic_ns(),guest_heap=int(heap),guest_mmap=int(mapped),**snapshot(p.pid)))
                 p.stdin.write("\n"); p.stdin.flush()
             elif words[0]=="time": times[words[1]]=int(words[2])
             elif words[0]=="sequence": seq[words[1]].append(words[2])
@@ -135,7 +137,9 @@ def benchmark(root,mode):
         result["sequences"]=dict(seq)
     elif mode=="stress":
         rows=[list(map(int,s.split())) for s in (ref.work/"latency-private.txt").read_text().splitlines()]
-        check(len(rows)==points[-1]["index"]==10000 and all(len(r)==5 for r in rows),"incomplete stress")
+        check(len(rows)==points[-1]["index"]==int.from_bytes(progress.read_bytes(),"little")==10000 and all(len(r)==5 for r in rows),"incomplete stress")
+        steady=[p for p in points if p["stage"]=="steady"]
+        result["wall_rate"]=1e13/(steady[-1]["monotonic_ns"]-steady[0]["monotonic_ns"])
         cols=list(zip(*rows))
         result.update(latency={k:stats(c) for k,c in zip(("copy","invoke","read","total"),cols)},
                       completed=len(rows),failed=0,first_failure=None,restarts=0,output_sha256=hashlib.sha256(bytes(cols[4])).hexdigest(),
@@ -214,6 +218,16 @@ def main():
              host_cpu=re.search(r"model name\s*:\s*(.+)",Path("/proc/cpuinfo").read_text())[1],
              threads=1,warmup=200,logical_host_cpus=os.cpu_count(),
              host_mem_available_kib=int(re.search(r"MemAvailable:\s+(\d+)",Path("/proc/meminfo").read_text())[1]),firmware={})
+    check(doc["qemu"].startswith("qemu-aarch64 version 8.2.2 "),"unexpected QEMU version")
+    doc["harness_sha256"]=ref.b.abi.digest(ref.work/"probe")
+    doc["manifest_sha256"]=ref.b.abi.digest(ref.work/"model.json")
+    doc["measurement"]=dict(latency="guest CLOCK_MONOTONIC nanoseconds",memory="host procfs KiB; guest mallinfo2 bytes",
+                            scope="QEMU user-mode; physical latency and memory unmeasured",
+                            cadence="ESPHome 2025.2.0 streaming_model.cpp; three ordered nonoverlapping slices per Invoke",
+                            frame_step_ms=10,batch_period_ms=30,queue_capacity_batches=2,
+                            postprocess="ESPhome reference: zero-filled 10-score window, sum/2550 strictly greater than 0.90",
+                            model_output="FlatBuffer UINT8 probability = raw / 256",
+                            reset="ResetVariableTensors applies only to is_variable tensors, not resource handles")
     errors=[]
     for n in ("14","15"):
         root=ref.work/"ota"/("capsule"+n)/"rootfs"
@@ -247,6 +261,10 @@ def main():
             try: row[mode]=benchmark(root,mode)
             except Exception as e:
                 errors.append(n+" "+mode+" "+type(e).__name__)
+                completed=0
+                if mode=="stress" and (ref.work/"completed-private").is_file():
+                    completed=int.from_bytes((ref.work/"completed-private").read_bytes(),"little")
+                print("FAILED",n,mode,type(e).__name__,"completed",completed,flush=True)
         if n=="14":
             fault=ref.work/"fault-probe"
             subprocess.run([sys.executable,"scripts/verify_elf_abi.py",fault,root,"--allow-library",ref.lib],check=True)

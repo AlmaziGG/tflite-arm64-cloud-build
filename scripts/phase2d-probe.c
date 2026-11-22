@@ -1,6 +1,9 @@
 #define _GNU_SOURCE
 #include <inttypes.h>
 #include <malloc.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,14 +120,21 @@ int main(int argc,char **argv) {
         }
         checkpoint("steady",0);
         FILE *samples=fopen("work/latency-private.txt","w");require(samples!=NULL,"metrics");
+        int fd=open("work/completed-private",O_RDWR|O_CREAT|O_TRUNC,0600);
+        require(fd>=0 && ftruncate(fd,sizeof(uint32_t))==0,"progress");
+        volatile uint32_t *progress=mmap(NULL,sizeof(uint32_t),PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+        require(progress!=MAP_FAILED,"progress-map");
+        close(fd);
         for(unsigned i=0;i<10000;i++) {
             struct sample s=step(it,i);
             require(fprintf(samples,"%"PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %u\n",
                     s.copy,s.invoke,s.read,s.total,(unsigned)s.value)>0,"metrics-write");
             completed++;
+            *progress=completed;
             if(completed%250==0) checkpoint("steady",completed);
         }
         require(fclose(samples)==0,"metrics-close");
+        munmap((void *)progress,sizeof(uint32_t));
         TfLiteInterpreterDelete(it); checkpoint("destroy",completed);
     } else if(!strcmp(argv[2],"lifecycle") || !strcmp(argv[2],"fullcycle")) {
         int full=!strcmp(argv[2],"fullcycle");
