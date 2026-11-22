@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -129,6 +130,46 @@ def golden():
     save("frontend-equivalence.json",features); save("streaming-results.json",streams)
 
 
+def rust_quantization(scale,zero):
+    # Rust uses f32 at each operation and rounds half away from zero.
+    f32=lambda x:struct.unpack("<f",struct.pack("<f",x))[0]
+    differences=[]
+    for x in range(65536):
+        z=f32(f32(f32(x*.0390625)/scale)+zero)
+        rust=max(-128,min(127,math.floor(z+.5) if z>=0 else math.ceil(z-.5)))
+        fixed=min(127,(x*256+333)//666-128)
+        if rust!=fixed:
+            differences.append((x,rust,fixed))
+    return {"tested":65536,"different":len(differences),"first":differences[0] if differences else None}
+
+
+def memory_stream(prefix,runner):
+    # Same unbroken PCM session. Each 16000-sample write blocks on the bounded
+    # kernel pipe until the consumer has read most of that second.
+    import tempfile
+    pcm=bytes(32000)
+    with tempfile.TemporaryFile() as errors, subprocess.Popen(
+            [*prefix,runner,ref.work/"model","-","160","-"],stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,stderr=errors) as child:
+        points=[]
+        try:
+            for i in range(60):
+                child.stdin.write(pcm); child.stdin.flush()
+                status=Path(f"/proc/{child.pid}/status").read_text()
+                points.append(int(re.search(r"(?m)^VmRSS:\s+(\d+) kB",status)[1]))
+            child.stdin.close()
+            check(child.wait(timeout=30)==0,"continuous process failed")
+        finally:
+            if child.poll() is None:
+                child.kill()
+        errors.seek(0)
+        metrics=re.search(rb"(?m)^metrics (\d+) (\d+) (\d+)",errors.read())
+        check(metrics and tuple(map(int,metrics.groups()))==(960000,5998,1999),"continuous sample accounting")
+    warm=points[10:]
+    return dict(seconds=60,points_kib=points,warm_median_kib=statistics.median(warm),
+                late_minus_early_kib=statistics.median(warm[-10:])-statistics.median(warm[:10]))
+
+
 def audit(elf,root):
     args=[sys.executable,"scripts/verify_elf_abi.py",elf,root]
     if elf!=ref.lib:
@@ -182,7 +223,7 @@ def matrix():
     # Global gate: complete all strict audits on both OTAs before the first emulated instruction.
     audits={}; failed=[]
     for n,root in roots.items():
-        for elf in (ref.lib,ref.exe,runner,replay):
+        for elf in (ref.lib,ref.exe,runner,replay,P/"tables-fast",P/"tables-off"):
             try:
                 audits[n,elf]=audit(elf,root)
             except subprocess.CalledProcessError as e:
@@ -195,7 +236,15 @@ def matrix():
         expected=actual_providers(audits[n,runner],root,runner)
         candidate(runner,[P/"tone440.wav"],160,prefix=["strace","-f","-yy","-qq","-e","trace=open,openat,openat2","-o",trace,*prefix])
         ref.b.verify_guest_opens(trace.read_text(),expected,root,{ref.lib,runner})
-        reports[n]={"strict_audits":4,"guest_providers":{p.name:h for p,h in expected.items()}}
+        table_control={}
+        native_tables=command([P/"tables-host"]).stdout.splitlines()
+        for mode in ("fast","off"):
+            guest_tables=command([*prefix,P/("tables-"+mode)]).stdout.splitlines()
+            check(len(guest_tables)==len(native_tables),"coefficient count")
+            delta=[(x.decode(),y.decode()) for x,y in zip(native_tables,guest_tables) if x!=y]
+            table_control[mode]=dict(count=len(delta),first=delta[:6])
+        print("Capsule",n,"initial coefficient differences",table_control,flush=True)
+        reports[n]={"strict_audits":6,"coefficient_control":table_control,"guest_providers":{p.name:h for p,h in expected.items()}}
         det[n]={}; resources[n]={}
         for name in NAMES:
             gold=(P/(name+".gold")).read_bytes()
@@ -225,11 +274,23 @@ def matrix():
         rss=P/"rss.private"
         command(["/usr/bin/time","-f","%M","-o",rss,*prefix,runner,ref.work/"model","-","160",P/"long.wav"])
         resources[n]["max_host_qemu_rss_kib"]=int(rss.read_text().strip())
+        resources[n]["continuous_host_rss"]=memory_stream(prefix,runner)
+        check(resources[n]["continuous_host_rss"]["late_minus_early_kib"]<=1024,"unexplained sustained RSS growth")
     check(det["14"]==det["15"],"OTA trace divergence")
+    # Native throughput is a feature extraction measurement (no x86 TFLite in this build).
+    _,hostmetrics,_=candidate(P/"host",[P/"long.wav"],160)
+    for n in roots:
+        resources[n]["host_frontend_long_total_ns"]=hostmetrics[0][7]
     save("detection-results.json",det); save("resource-summary.json",resources)
     info=ref.b.p2.metadata(runner)
     info.pop("definitions",None)
+    inp=graph["subgraphs"][0]["inputs"][0]
+    quant=rust_quantization(inp["scale"][0],inp["zero"][0])
+    check(quant["different"]>0,"unexpected Rust quantization result")
     save("phase3-report.json",dict(commit=os.environ["GITHUB_SHA"],model=previous.MODEL,graph=graph,
+                                   rust_quantization_comparison=quant, sdk_sha256=ref.b.ARCHIVE_SHA,
+                                   sdk_sysroot=ref.b.owned(ref.b.p2.output([ref.b.GCC,"-print-sysroot"]),ref.b.SDK),
+                                   frontend_archives={p.stem:ref.b.abi.digest(p) for p in sorted(P.glob("*.tgz"))},
                                    baseline=ref.pins,elf=info,firmware=reports,real_speech="NOT TESTED",
                                    qemu=ref.b.p2.output(["qemu-aarch64","--version"]).splitlines()[0],
                                    compiler=ref.b.p2.output([ref.b.GCC,"-dumpfullversion"]),
@@ -255,7 +316,7 @@ def validate(bodies,commit):
     check(set(doc["firmware"])==set(detect)==set(resource)=={"14","15"},"firmware coverage")
     check(set(features)==set(streams)==set(NAMES) and detect["14"]==detect["15"],"fixture coverage")
     for n in ("14","15"):
-        check(doc["firmware"][n]["strict_audits"]==4 and doc["firmware"][n]["guest_providers"][ref.lib.name]==ref.pins[ref.lib.name],"ABI evidence")
+        check(doc["firmware"][n]["strict_audits"]==6 and doc["firmware"][n]["guest_providers"][ref.lib.name]==ref.pins[ref.lib.name],"ABI evidence")
         check(set(detect[n])==set(NAMES) and resource[n]["max_host_qemu_rss_kib"]>0,"measurement coverage")
     for name in NAMES:
         f=features[name]; data=fixture(name); frames=max(0,(len(data)//2-480)//160+1)

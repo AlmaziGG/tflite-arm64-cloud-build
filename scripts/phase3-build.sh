@@ -29,10 +29,15 @@ units=(kiss_fft_int16 fft fft_util filterbank filterbank_util frontend frontend_
 sources=(work/p3/rust/native/frontend_bridge.cc "$v/kissfft/kiss_fft.cc" "$v/kissfft/tools/kiss_fftr.cc")
 for u in "${units[@]}"; do sources+=("$src/$u.cc"); done
 flags=(-O2 -std=c++17 -DFIXED_POINT=16 -I"$v" -I"$v/kissfft")
+tables=(-Iwork/p3/rust/native scripts/phase3-tables.cc "${sources[@]:1}")
+g++ "${flags[@]}" -ffp-contract=off "${tables[@]}" -o work/p3/tables-host
 g++ "${flags[@]}" -DFEATURES_ONLY scripts/phase3-runner.cc "${sources[@]}" -o work/p3/host
 python3 scripts/phase3.py golden
 cc=work/armgnu103/bin/aarch64-none-linux-gnu
-strace -f -e execve -o work/p3/compiler.trace "$cc-g++" -march=armv8-a "${flags[@]}" -Iwork/include scripts/phase3-runner.cc "${sources[@]}" -Lartifacts -ltensorflowlite_c -Wl,-t -o work/p3/runner > work/p3/link.inputs
+for mode in fast off; do
+  "$cc-g++" -march=armv8-a "-ffp-contract=$mode" "${flags[@]}" "${tables[@]}" -o "work/p3/tables-$mode"
+done
+strace -f -e execve -o work/p3/compiler.trace "$cc-g++" -march=armv8-a -ffp-contract=off "${flags[@]}" -Iwork/include scripts/phase3-runner.cc "${sources[@]}" -Lartifacts -ltensorflowlite_c -Wl,-t -o work/p3/runner > work/p3/link.inputs
 grep -Eq 'execve\("[^"]*/ld[^"]*".*= 0$' work/p3/compiler.trace
 grep -F 'artifacts/libtensorflowlite_c.so' work/p3/link.inputs
 "$cc-gcc" -std=c11 -O2 -march=armv8-a -Iwork/include scripts/phase3-replay.c -Lartifacts -ltensorflowlite_c -o work/p3/replay

@@ -205,7 +205,7 @@ int main(int argc,char **argv) {
         File trace(nullptr,fclose);
         if(strcmp(argv[2],"-")) {trace.reset(fopen(argv[2],"wb")); require(bool(trace),"trace open");}
 #ifndef FEATURES_ONLY
-        require(!strcmp(TfLiteVersion(),"2.17.1") || !strcmp(TfLiteVersion(),"2.17.0"),"runtime version");
+        require(!strcmp(TfLiteVersion(),"2.17.1"),"runtime version");
         Model model(TfLiteModelCreateFromFile(argv[1]),TfLiteModelDelete);
         require(bool(model),"model");
         ModelPtr m=model.get();
